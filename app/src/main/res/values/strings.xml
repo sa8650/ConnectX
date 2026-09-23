@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ConnectX</string>
+    <string name="channel_gateway">SMS gateway</string>
+    <string name="tagline">Android SMS Gateway</string>
+    <string name="powered_by">Powered by Dexter Studio</string>
+</resources>
