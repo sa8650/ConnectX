@@ -1,34 +1,56 @@
-# ConnectX
+# ConnectX — Android SMS Gateway for EMS
 
-Native Android SMS companion for **EMS**. This is not a second EMS app.
+> **Automated Cellular SMS Gateway for EMS (Point of Sale & Enterprise Management System)**  
+> Turn your Android device into a dedicated, cost-effective cellular SMS dispatch server.
 
-**ConnectX — Android SMS Gateway. Powered by Dexter Studio.**
+[![Android SDK 35](https://img.shields.io/badge/Android%20SDK-35-2383E2.svg)](https://developer.android.com)
+[![Kotlin 2.1.0](https://img.shields.io/badge/Kotlin-2.1.0-7F52FF.svg)](https://kotlinlang.org)
+[![Jetpack Compose](https://img.shields.io/badge/Compose-Material%203-4285F4.svg)](https://developer.android.com/jetpack/compose)
+[![Theme: Light](https://img.shields.io/badge/UI-Mobbin%20Light-2383E2.svg)](#ui-and-design-system)
 
-Administrators sign in with the same email and password used on the EMS website (no Shop ID). The phone registers as an SMS gateway for one or more shops. Customer messages are sent from the selected SIM. EMS never controls the SIM and never stores SIM credentials.
+---
 
-## What this app does
+## 🌟 Key Highlights
 
-- Sign in as EMS administrator
-- Connect one phone to multiple shops
-- Request SMS permission and choose a SIM
-- Register a device token (password is not kept after setup)
-- Send a test SMS, or skip and do it later from Settings
-- Pull queued jobs in the background and send them
-- Home / Activity / Settings per shop
-- Switch shop and sending number in-app
-- View the full SMS body from Activity
-- Log out without creating a duplicate device
+- ⚡ **Direct Cellular Dispatch**: Sends customer transaction SMS directly from your local SIM card with zero aggregator markups.
+- 🎨 **Modern Light UI Theme**: Crisp white (`#FFFFFF`) canvas, Electric Azure Blue (`rgb(35, 131, 226)`), and Pearl surfaces.
+- 📱 **Mobbin-Inspired Onboarding**: Interactive 4-step walkthrough with visual feature highlights and progress indicators.
+- 👤 **Administrator Profile**: Complete administrator profile dashboard showing authentic Short ID (`#1001`), verified credentials, registered phone, address, and server infrastructure.
+- 🏷️ **Formatted Message Types**: Replaced "null" card titles with formatted categories (Sales Invoice Confirmation, Due Invoice Reminder, Exchange Invoice Confirmation, Return Invoice Confirmation, Payment Confirmation, Custom Message).
+- 🚫 **Cancel Queued SMS**: One-tap cancellation for pending/queued messages directly from the Activity feed and detail modal.
+- 🔄 **Multi-Store & Dual-SIM Routing**: Pair multiple retail outlets to a single device and assign dedicated SIM slots.
+- ⏳ **Best-in-Class Loaders**: Smooth circular progress spinners and animated skeleton shimmer loading rows.
+- 🛡️ **Enterprise Security**: Android KeyStore hardware token encryption with zero administrator password retention.
 
-## What this app does not do
+---
 
-- Inventory, sales, customers, reports, or invoices
-- WebView of EMS
-- Embed Supabase service-role keys or other privileged secrets
+## 🚀 Quick Setup
 
-## Build
+1. **Clone the Repository**:
+   ```bash
+   git clone https://github.com/sa8650/ConnectX.git
+   ```
+2. **Open in Android Studio** (Ladybug 2024.2.1+ or newer with JDK 17).
+3. **Build and Run**:
+   ```bash
+   ./gradlew assembleDebug
+   ```
+4. **Sign In**:
+   - Enter your **EMS Website URL** (e.g., `https://your-ems.pages.dev`).
+   - Enter your **Administrator Email** and **Password**.
+   - Select your shop, grant SMS/Phone permissions, and pick your sending SIM.
 
-See **[BUILD_ANDROID.md](BUILD_ANDROID.md)** for step-by-step Android Studio instructions. An APK cannot be compiled in this workspace (no Android SDK).
+---
 
-## EMS side
+## 📖 Comprehensive Documentation
 
-Apply migration `041_connectx_sms_gateway.sql` (or the D1 equivalent) and deploy the updated EMS API + Settings → Communication UI.
+For complete technical specifications, full API references, architecture diagrams, telephony details, and EMS integration schemas, see:
+
+👉 **[CONNECTX_DOCUMENTATION.md](./CONNECTX_DOCUMENTATION.md)**
+
+---
+
+## 📄 License & Attribution
+
+Built and maintained by **Dexter Studio** for **EMS**.  
+All rights reserved.

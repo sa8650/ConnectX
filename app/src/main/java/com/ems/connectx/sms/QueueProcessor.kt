@@ -16,6 +16,7 @@ object QueueProcessor {
             for (job in jobs) {
                 if (job.shopId != conn.shopId) continue
                 if (prefs.claimed(job.id)) continue
+                if (prefs.isCancelled(job.id)) continue
                 prefs.markClaimed(job.id)
                 try {
                     SmsSender.send(

@@ -30,6 +30,10 @@ class Prefs(context: Context) {
         get() = store.getString("adminToken", "") ?: ""
         set(v) = store.edit().putString("adminToken", v).apply()
 
+    var adminId: String
+        get() = store.getString("adminId", "") ?: ""
+        set(v) = store.edit().putString("adminId", v).apply()
+
     var adminEmail: String
         get() = store.getString("adminEmail", "") ?: ""
         set(v) = store.edit().putString("adminEmail", v).apply()
@@ -37,6 +41,26 @@ class Prefs(context: Context) {
     var adminName: String
         get() = store.getString("adminName", "") ?: ""
         set(v) = store.edit().putString("adminName", v).apply()
+
+    var adminCode: String
+        get() = store.getString("adminCode", "") ?: ""
+        set(v) = store.edit().putString("adminCode", v).apply()
+
+    var adminPhone: String
+        get() = store.getString("adminPhone", "") ?: ""
+        set(v) = store.edit().putString("adminPhone", v).apply()
+
+    var adminAddress: String
+        get() = store.getString("adminAddress", "") ?: ""
+        set(v) = store.edit().putString("adminAddress", v).apply()
+
+    var adminCreatedAt: String
+        get() = store.getString("adminCreatedAt", "") ?: ""
+        set(v) = store.edit().putString("adminCreatedAt", v).apply()
+
+    var adminActive: Boolean
+        get() = store.getBoolean("adminActive", true)
+        set(v) = store.edit().putBoolean("adminActive", v).apply()
 
     var activeShopId: String
         get() = store.getString("activeShopId", "") ?: ""
@@ -54,9 +78,33 @@ class Prefs(context: Context) {
         get() = store.getBoolean("signedIn", connections().any { it.setupComplete })
         set(v) = store.edit().putBoolean("signedIn", v).apply()
 
+    fun getAdminProfile(): AdminProfile {
+        return AdminProfile(
+            id = adminId,
+            adminCode = adminCode,
+            name = adminName,
+            email = adminEmail,
+            phone = adminPhone,
+            address = adminAddress,
+            active = adminActive,
+            createdAt = adminCreatedAt
+        )
+    }
+
+    fun saveAdminProfile(profile: AdminProfile) {
+        if (profile.id.isNotBlank()) adminId = profile.id
+        if (profile.adminCode.isNotBlank()) adminCode = profile.adminCode
+        if (profile.name.isNotBlank()) adminName = profile.name
+        if (profile.email.isNotBlank()) adminEmail = profile.email
+        if (profile.phone.isNotBlank()) adminPhone = profile.phone
+        if (profile.address.isNotBlank()) adminAddress = profile.address
+        if (profile.createdAt.isNotBlank()) adminCreatedAt = profile.createdAt
+        adminActive = profile.active
+    }
+
     fun connections(): List<Connection> {
         val raw = store.getString("connections", "[]") ?: "[]"
-        val arr = JSONArray(raw)
+        val arr = try { JSONArray(raw) } catch (_: Exception) { JSONArray() }
         return buildList {
             for (i in 0 until arr.length()) {
                 val o = arr.getJSONObject(i)
@@ -68,6 +116,9 @@ class Prefs(context: Context) {
                         adminId = o.optString("adminId"),
                         adminEmail = o.optString("adminEmail"),
                         adminName = o.optString("adminName"),
+                        adminCode = o.optString("adminCode"),
+                        adminPhone = o.optString("adminPhone"),
+                        adminAddress = o.optString("adminAddress"),
                         deviceId = o.optString("deviceId"),
                         devicePublicId = o.optString("devicePublicId"),
                         deviceToken = o.optString("deviceToken"),
@@ -109,6 +160,9 @@ class Prefs(context: Context) {
                 put("adminId", c.adminId)
                 put("adminEmail", c.adminEmail)
                 put("adminName", c.adminName)
+                put("adminCode", c.adminCode)
+                put("adminPhone", c.adminPhone)
+                put("adminAddress", c.adminAddress)
                 put("deviceId", c.deviceId)
                 put("devicePublicId", c.devicePublicId)
                 put("deviceToken", c.deviceToken)
@@ -123,6 +177,9 @@ class Prefs(context: Context) {
 
     fun claimed(jobId: String): Boolean = store.getBoolean("job:$jobId", false)
     fun markClaimed(jobId: String) = store.edit().putBoolean("job:$jobId", true).apply()
+
+    fun isCancelled(jobId: String): Boolean = store.getBoolean("cancel:$jobId", false)
+    fun markCancelled(jobId: String) = store.edit().putBoolean("cancel:$jobId", true).apply()
 
     fun clearSession() {
         val url = baseUrl
