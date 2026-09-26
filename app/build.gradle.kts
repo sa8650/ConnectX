@@ -7,14 +7,14 @@ plugins {
 }
 
 android {
-    namespace = "com.ems.connectx"
+    namespace = "com.connectx.gateway"
     compileSdk = 35
     defaultConfig {
-        applicationId = "com.ems.connectx"
+        applicationId = "com.connectx.gateway"
         minSdk = 26
         targetSdk = 35
-        versionCode = 17
-        versionName = "1.6.0"
+        versionCode = 19
+        versionName = "2.1.0"
         vectorDrawables.useSupportLibrary = true
     }
     buildTypes {

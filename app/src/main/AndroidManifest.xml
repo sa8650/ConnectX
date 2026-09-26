@@ -68,7 +68,7 @@
             android:name=".sms.SmsSentReceiver"
             android:exported="false">
             <intent-filter>
-                <action android:name="com.ems.connectx.SMS_SENT" />
+                <action android:name="com.connectx.gateway.SMS_SENT" />
             </intent-filter>
         </receiver>
     </application>

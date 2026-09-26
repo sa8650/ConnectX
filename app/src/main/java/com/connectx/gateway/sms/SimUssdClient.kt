@@ -1,4 +1,4 @@
-package com.ems.connectx.sms
+package com.connectx.gateway.sms
 
 import android.Manifest
 import android.content.Context
@@ -7,7 +7,7 @@ import android.os.Handler
 import android.os.Looper
 import android.telephony.TelephonyManager
 import androidx.core.content.ContextCompat
-import com.ems.connectx.data.CarrierBalanceConfig
+import com.connectx.gateway.data.CarrierBalanceConfig
 import kotlin.coroutines.resume
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull

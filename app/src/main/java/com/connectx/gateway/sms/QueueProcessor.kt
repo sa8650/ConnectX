@@ -1,8 +1,8 @@
-package com.ems.connectx.sms
+package com.connectx.gateway.sms
 
 import android.content.Context
-import com.ems.connectx.data.Api
-import com.ems.connectx.data.Prefs
+import com.connectx.gateway.data.Api
+import com.connectx.gateway.data.Prefs
 
 object QueueProcessor {
     @Synchronized

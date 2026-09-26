@@ -1,4 +1,4 @@
-package com.ems.connectx.sms
+package com.connectx.gateway.sms
 
 import android.app.Notification
 import android.app.PendingIntent
@@ -7,10 +7,10 @@ import android.content.Context
 import android.content.Intent
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
-import com.ems.connectx.ConnectXApp
-import com.ems.connectx.MainActivity
-import com.ems.connectx.R
-import com.ems.connectx.data.Prefs
+import com.connectx.gateway.ConnectXApp
+import com.connectx.gateway.MainActivity
+import com.connectx.gateway.R
+import com.connectx.gateway.data.Prefs
 import java.util.Timer
 import java.util.TimerTask
 
@@ -21,7 +21,7 @@ class GatewayService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val prefs = Prefs(this)
-        val shop = prefs.active()?.shopName ?: "EMS"
+        val shop = prefs.active()?.shopName ?: "ConnectX"
         startForeground(42, notice("ConnectX is waiting for $shop SMS jobs."))
         timer?.cancel()
         timer = Timer("connectx-drain", true)

@@ -1,4 +1,4 @@
-package com.ems.connectx.data
+package com.connectx.gateway.data
 
 import android.content.Context
 import android.content.SharedPreferences
@@ -22,13 +22,28 @@ class Prefs(context: Context) {
         app.getSharedPreferences("connectx.fallback", Context.MODE_PRIVATE)
     }
 
+    /** The ConnectX Control origin. The app ships with the official address
+     * built in; a custom one is stored only after the operator enters it on
+     * the connect screen (shown when the built-in address is unreachable). */
     var baseUrl: String
-        get() = store.getString("baseUrl", "") ?: ""
+        get() = (store.getString("baseUrl", "") ?: "").ifBlank { GatewayUrl.BUILT_IN }
         set(v) {
-            // Keep blank for a cleared/unconfigured session; never persist a
-            // malformed "https:/" address that would later resolve host https.
-            store.edit().putString("baseUrl", if (v.isBlank()) "" else EmsSiteUrl.normalize(v)).apply()
+            // Keep blank for the built-in default; never persist a malformed
+            // "https:/" address that would later resolve host https.
+            store.edit().putString("baseUrl", if (v.isBlank()) "" else GatewayUrl.normalize(v)).apply()
         }
+
+    /** True when no custom URL was saved - the built-in official site is used. */
+    val usingBuiltInUrl: Boolean
+        get() = (store.getString("baseUrl", "") ?: "").isBlank()
+
+    var systemKey: String
+        get() = store.getString("systemKey", "") ?: ""
+        set(v) = store.edit().putString("systemKey", v).apply()
+
+    var systemName: String
+        get() = store.getString("systemName", "") ?: ""
+        set(v) = store.edit().putString("systemName", v).apply()
 
     var lastNotifiedUpdateCode: Int
         get() = store.getInt("lastNotifiedUpdateCode", 0)
@@ -121,6 +136,8 @@ class Prefs(context: Context) {
                         shopId = o.getString("shopId"),
                         shopName = o.optString("shopName"),
                         shopAddress = o.optString("shopAddress"),
+                        systemKey = o.optString("systemKey"),
+                        systemName = o.optString("systemName"),
                         adminId = o.optString("adminId"),
                         adminEmail = o.optString("adminEmail"),
                         adminName = o.optString("adminName"),
@@ -165,6 +182,8 @@ class Prefs(context: Context) {
                 put("shopId", c.shopId)
                 put("shopName", c.shopName)
                 put("shopAddress", c.shopAddress)
+                put("systemKey", c.systemKey)
+                put("systemName", c.systemName)
                 put("adminId", c.adminId)
                 put("adminEmail", c.adminEmail)
                 put("adminName", c.adminName)
@@ -192,9 +211,11 @@ class Prefs(context: Context) {
     fun clearSession() {
         // Old builds may have saved an incomplete address. Do not let an
         // invalid legacy URL prevent logout or reappear on the next login.
-        val url = runCatching { EmsSiteUrl.normalize(baseUrl) }.getOrNull().orEmpty()
+        // A valid custom URL survives logout; an invalid one falls back to
+        // the built-in official ConnectX Control address.
+        val url = runCatching { GatewayUrl.normalize(store.getString("baseUrl", "") ?: "") }.getOrNull().orEmpty()
         store.edit().clear().apply()
-        baseUrl = url
+        if (url.isNotBlank()) baseUrl = url
         seenGetStarted = true
     }
 }

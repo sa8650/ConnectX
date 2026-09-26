@@ -1,4 +1,4 @@
-package com.ems.connectx.data
+package com.connectx.gateway.data
 
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -31,7 +31,7 @@ private fun JSONObject.emailAddresses(field: String): List<String> {
 }
 
 internal fun JSONObject.toEmailItem(): EmailItem = EmailItem(
-    id = optStringOrNull("id") ?: throw IllegalStateException("Invalid EMS email record."),
+    id = optStringOrNull("id") ?: throw IllegalStateException("Invalid ConnectX email record."),
     subject = optStringOrNull("subject") ?: "(No subject)",
     fromEmail = optStringOrNull("from_email") ?: "",
     toEmails = emailAddresses("to_emails"),
@@ -53,13 +53,13 @@ class Api(private val prefs: Prefs) {
         .build()
     private val jsonType = "application/json; charset=utf-8".toMediaType()
 
-    private fun url(path: String): String = "${EmsSiteUrl.normalize(prefs.baseUrl)}/api/$path"
+    private fun url(path: String): String = "${GatewayUrl.normalize(prefs.baseUrl)}/api/$path"
 
     private fun execute(request: Request): okhttp3.Response = try {
         http.newCall(request).execute()
     } catch (error: UnknownHostException) {
         throw IllegalStateException(
-            "Cannot find your EMS website (${prefs.baseUrl}). Copy the FULL deployed URL from your phone's browser; check internet/DNS.", error
+            "Cannot find the ConnectX Control website (${prefs.baseUrl}). Copy the FULL deployed URL from your phone's browser; check internet/DNS.", error
         )
     }
 
@@ -91,32 +91,51 @@ class Api(private val prefs: Prefs) {
         }
     }
 
-    fun adminLogin(email: String, password: String): JSONObject {
+    /** The system dropdown on the sign-in screen (EMS present; InfluenceOS,
+     * CareOS, PlugX as they are connected). Served by the ConnectX website -
+     * it never exposes the systems' own API URLs to the phone. */
+    fun systems(): List<SystemOption> {
+        val r = call("device/systems", token = null)
+        val arr = r.optJSONArray("systems") ?: JSONArray()
+        return buildList {
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                add(
+                    SystemOption(
+                        key = o.getString("key"),
+                        name = o.optStringOrNull("name") ?: o.getString("key"),
+                        available = o.optBoolean("available", false)
+                    )
+                )
+            }
+        }
+    }
+
+    /** Federated administrator sign-in: ConnectX verifies the credentials
+     * against the selected system's own API and returns a ConnectX session
+     * plus the administrator's shops. The phone never talks to the system. */
+    fun adminLogin(systemKey: String, email: String, password: String): JSONObject {
         val r = call(
-            "auth/admin/login", "POST",
-            JSONObject().put("email", email).put("password", password),
+            "device/auth/login", "POST",
+            JSONObject().put("system", systemKey).put("email", email).put("password", password),
             token = null
         )
         prefs.adminToken = r.optString("token")
-        val user = r.optJSONObject("user")
-        if (user != null) {
-            val adminCode = user.optStringOrNull("admin_code") ?: user.optStringOrNull("adminCode") ?: ""
-            val phone = user.optStringOrNull("phone") ?: ""
-            val address = user.optStringOrNull("address") ?: ""
-            val name = user.optStringOrNull("name") ?: ""
-            val id = user.optStringOrNull("id") ?: ""
-            val createdAt = user.optStringOrNull("created_at") ?: ""
-            val active = user.optBoolean("active", true)
+        val system = r.optJSONObject("system")
+        prefs.systemKey = system?.optStringOrNull("key") ?: systemKey
+        prefs.systemName = system?.optStringOrNull("name") ?: prefs.systemKey
 
+        val user = r.optJSONObject("administrator") ?: r.optJSONObject("admin") ?: r.optJSONObject("user")
+        if (user != null) {
             val p = AdminProfile(
-                id = id,
-                adminCode = adminCode,
-                name = name,
+                id = user.optStringOrNull("id") ?: "",
+                adminCode = user.optStringOrNull("admin_code") ?: user.optStringOrNull("adminCode") ?: "",
+                name = user.optStringOrNull("name") ?: "",
                 email = user.optStringOrNull("email") ?: email,
-                phone = phone,
-                address = address,
-                active = active,
-                createdAt = createdAt
+                phone = user.optStringOrNull("phone") ?: "",
+                address = user.optStringOrNull("address") ?: "",
+                active = user.optBoolean("active", true),
+                createdAt = user.optStringOrNull("created_at") ?: ""
             )
             prefs.saveAdminProfile(p)
         }
@@ -124,11 +143,12 @@ class Api(private val prefs: Prefs) {
     }
 
     fun fetchAdminProfile(shopId: String? = null): AdminProfile {
-        // Try device token gateway 'me' route first
+        // Device-token route: 'me' returns the administrator behind this device
+        // (null for code-paired phones with no administrator sign-in).
         try {
             val token = runCatching { deviceToken(shopId) }.getOrNull()
             if (!token.isNullOrBlank()) {
-                val r = call("connectx/gateway/me", token = token)
+                val r = call("device/me", token = token)
                 val adminObj = r.optJSONObject("administrator")
                 if (adminObj != null) {
                     val p = AdminProfile(
@@ -147,22 +167,30 @@ class Api(private val prefs: Prefs) {
             }
         } catch (_: Exception) {}
 
-        // Fallback: Admin profile endpoint with admin token
+        // Admin-session route: re-sync through the administrator's shop list.
         try {
             if (prefs.adminToken.isNotBlank()) {
-                val r = call("admin/profile", token = prefs.adminToken)
-                val p = AdminProfile(
-                    id = r.optStringOrNull("id") ?: prefs.adminId,
-                    adminCode = r.optStringOrNull("admin_code") ?: r.optStringOrNull("adminCode") ?: prefs.adminCode,
-                    name = r.optStringOrNull("name") ?: prefs.adminName,
-                    email = r.optStringOrNull("email") ?: prefs.adminEmail,
-                    phone = r.optStringOrNull("phone") ?: prefs.adminPhone,
-                    address = r.optStringOrNull("address") ?: prefs.adminAddress,
-                    active = r.optBoolean("active", true),
-                    createdAt = r.optStringOrNull("created_at") ?: prefs.adminCreatedAt
-                )
-                prefs.saveAdminProfile(p)
-                return p
+                val r = call("device/shops", token = prefs.adminToken)
+                val admin = r.optJSONObject("administrator")
+                val system = r.optJSONObject("system")
+                if (system != null) {
+                    prefs.systemKey = system.optStringOrNull("key") ?: prefs.systemKey
+                    prefs.systemName = system.optStringOrNull("name") ?: prefs.systemName
+                }
+                if (admin != null) {
+                    val p = AdminProfile(
+                        id = admin.optStringOrNull("id") ?: prefs.adminId,
+                        adminCode = admin.optStringOrNull("admin_code") ?: admin.optStringOrNull("adminCode") ?: prefs.adminCode,
+                        name = admin.optStringOrNull("name") ?: prefs.adminName,
+                        email = admin.optStringOrNull("email") ?: prefs.adminEmail,
+                        phone = admin.optStringOrNull("phone") ?: prefs.adminPhone,
+                        address = admin.optStringOrNull("address") ?: prefs.adminAddress,
+                        active = admin.optBoolean("active", true),
+                        createdAt = admin.optStringOrNull("created_at") ?: prefs.adminCreatedAt
+                    )
+                    prefs.saveAdminProfile(p)
+                    return p
+                }
             }
         } catch (_: Exception) {}
 
@@ -170,7 +198,12 @@ class Api(private val prefs: Prefs) {
     }
 
     fun shops(): List<Shop> {
-        val r = call("connectx/gateway/shops", token = prefs.adminToken)
+        val r = call("device/shops", token = prefs.adminToken)
+        val system = r.optJSONObject("system")
+        if (system != null) {
+            prefs.systemKey = system.optStringOrNull("key") ?: prefs.systemKey
+            prefs.systemName = system.optStringOrNull("name") ?: prefs.systemName
+        }
         val admin = r.optJSONObject("administrator")
         if (admin != null) {
             val adminCode = admin.optStringOrNull("admin_code") ?: admin.optStringOrNull("adminCode") ?: prefs.adminCode
@@ -202,6 +235,7 @@ class Api(private val prefs: Prefs) {
                         address = o.optStringOrNull("address") ?: "",
                         phone = o.optStringOrNull("phone") ?: "",
                         shopCode = o.optStringOrNull("shop_code") ?: "",
+                        category = o.optStringOrNull("category") ?: "",
                         connected = o.optBoolean("connected", false)
                     )
                 )
@@ -218,9 +252,9 @@ class Api(private val prefs: Prefs) {
         phone: String
     ): Connection {
         val r = call(
-            "connectx/gateway/register", "POST",
+            "device/register", "POST",
             JSONObject()
-                .put("storeId", shopId)
+                .put("shopId", shopId)
                 .put("deviceName", deviceName)
                 .put("androidVersion", androidVersion)
                 .put("simSubscriptionId", simId)
@@ -230,7 +264,12 @@ class Api(private val prefs: Prefs) {
         )
         val device = r.getJSONObject("device")
         val shop = r.getJSONObject("shop")
+        val system = r.optJSONObject("system")
         val admin = r.optJSONObject("administrator")
+        if (system != null) {
+            prefs.systemKey = system.optStringOrNull("key") ?: prefs.systemKey
+            prefs.systemName = system.optStringOrNull("name") ?: prefs.systemName
+        }
 
         val adminCode = admin?.optStringOrNull("admin_code") ?: admin?.optStringOrNull("adminCode") ?: prefs.adminCode
         val adminPhone = admin?.optStringOrNull("phone") ?: prefs.adminPhone
@@ -258,12 +297,66 @@ class Api(private val prefs: Prefs) {
             shopId = shop.getString("id"),
             shopName = shop.optStringOrNull("name") ?: "Shop",
             shopAddress = shop.optStringOrNull("address") ?: "",
+            systemKey = prefs.systemKey,
+            systemName = prefs.systemName,
             adminId = adminId,
             adminEmail = adminEmail,
             adminName = adminName,
             adminCode = adminCode,
             adminPhone = adminPhone,
             adminAddress = adminAddress,
+            deviceId = device.getString("id"),
+            devicePublicId = device.optStringOrNull("device_public_id") ?: "",
+            deviceToken = r.getString("deviceToken"),
+            simSubscriptionId = simId,
+            simCarrier = carrier,
+            phoneNumber = phone,
+            setupComplete = false
+        )
+        prefs.saveConnection(conn)
+        prefs.activeShopId = conn.shopId
+        return conn
+    }
+
+    /** Account-free pairing: a short-lived code generated in ConnectX Control
+     * (Gateways → Pair new gateway) binds this phone to a shop and
+     * returns its revocable device token. No operator credentials involved. */
+    fun pairDevice(
+        code: String,
+        deviceName: String,
+        androidVersion: String,
+        appVersion: String,
+        simId: Int,
+        carrier: String,
+        phone: String
+    ): Connection {
+        val r = call(
+            "device/pair", "POST",
+            JSONObject()
+                .put("code", code)
+                .put("deviceName", deviceName)
+                .put("androidVersion", androidVersion)
+                .put("appVersion", appVersion)
+                .put("simSubscriptionId", simId)
+                .put("simCarrier", carrier)
+                .put("phoneNumber", phone),
+            token = null
+        )
+        val device = r.getJSONObject("device")
+        val shop = r.getJSONObject("shop")
+        val system = r.optJSONObject("system")
+        val conn = Connection(
+            shopId = shop.getString("id"),
+            shopName = shop.optStringOrNull("name") ?: "Shop",
+            shopAddress = shop.optStringOrNull("address") ?: "",
+            systemKey = system?.optStringOrNull("key") ?: "",
+            systemName = system?.optStringOrNull("name") ?: "",
+            adminId = "",
+            adminEmail = "",
+            adminName = "",
+            adminCode = "",
+            adminPhone = "",
+            adminAddress = "",
             deviceId = device.getString("id"),
             devicePublicId = device.optStringOrNull("device_public_id") ?: "",
             deviceToken = r.getString("deviceToken"),
@@ -284,10 +377,10 @@ class Api(private val prefs: Prefs) {
     }
 
     fun heartbeat(shopId: String? = null): JSONObject =
-        call("connectx/gateway/heartbeat", "POST", JSONObject(), deviceToken(shopId))
+        call("device/heartbeat", "POST", JSONObject(), deviceToken(shopId))
 
     fun claim(shopId: String, limit: Int = 8): List<SmsJob> {
-        val r = call("connectx/gateway/claim", "POST", JSONObject().put("limit", limit), deviceToken(shopId))
+        val r = call("device/jobs/claim", "POST", JSONObject().put("limit", limit), deviceToken(shopId))
         val arr = r.optJSONArray("jobs") ?: JSONArray()
         return buildList {
             for (i in 0 until arr.length()) {
@@ -311,7 +404,7 @@ class Api(private val prefs: Prefs) {
 
     fun report(shopId: String, jobId: String, sent: Boolean, error: String? = null) {
         call(
-            "connectx/gateway/report", "POST",
+            "device/jobs/report", "POST",
             JSONObject()
                 .put("jobId", jobId)
                 .put("status", if (sent) "sent" else "failed")
@@ -320,11 +413,11 @@ class Api(private val prefs: Prefs) {
         )
     }
 
-    /** Cancel only if EMS confirms deletion of a queued job. Never claim a
+    /** Cancel only if ConnectX confirms deletion of a queued job. Never claim a
      * cancellation succeeded after a network failure: it could silently drop SMS. */
     fun cancelJob(shopId: String, jobId: String): Boolean {
         val res = call(
-            "connectx/gateway/cancel", "POST",
+            "device/jobs/cancel", "POST",
             JSONObject().put("jobId", jobId),
             deviceToken(shopId)
         )
@@ -334,13 +427,13 @@ class Api(private val prefs: Prefs) {
     }
 
     fun markTest(shopId: String, ok: Boolean) {
-        call("connectx/gateway/test", "POST", JSONObject().put("ok", ok).put("record", false), deviceToken(shopId))
+        call("device/test", "POST", JSONObject().put("ok", ok).put("record", false), deviceToken(shopId))
         prefs.updateConnection(shopId) { it.copy(setupComplete = ok) }
     }
 
     fun updateSim(shopId: String, simId: Int, carrier: String, phone: String) {
         call(
-            "connectx/gateway/sim", "PATCH",
+            "device/sim", "PATCH",
             JSONObject().put("simSubscriptionId", simId).put("simCarrier", carrier).put("phoneNumber", phone),
             deviceToken(shopId)
         )
@@ -352,7 +445,7 @@ class Api(private val prefs: Prefs) {
     fun simCarrier(shopId: String, mccMnc: String, carrierName: String): CarrierBalanceConfig? {
         val query = "mccMnc=${URLEncoder.encode(mccMnc, "UTF-8")}" +
             "&carrierName=${URLEncoder.encode(carrierName, "UTF-8")}"
-        val response = call("connectx/gateway/sim-carrier?$query", token = deviceToken(shopId))
+        val response = call("device/sim-carrier?$query", token = deviceToken(shopId))
         if (!response.optBoolean("supported", false)) return null
         val carrier = response.optJSONObject("carrier") ?: return null
         return CarrierBalanceConfig(
@@ -363,10 +456,11 @@ class Api(private val prefs: Prefs) {
     }
 
     fun stats(shopId: String): HomeStats {
-        val r = call("connectx/gateway/stats?utcOffsetMinutes=${localOffsetMinutes()}", token = deviceToken(shopId))
+        val r = call("device/stats?utcOffsetMinutes=${localOffsetMinutes()}", token = deviceToken(shopId))
         val shop = r.optJSONObject("shop")
         val admin = r.optJSONObject("administrator")
         val device = r.optJSONObject("device")
+        val system = r.optJSONObject("system")
         val conn = prefs.connections().firstOrNull { it.shopId == shopId }
 
         val adminCode = admin?.optStringOrNull("admin_code") ?: admin?.optStringOrNull("adminCode") ?: prefs.adminCode
@@ -400,6 +494,7 @@ class Api(private val prefs: Prefs) {
             shopName = shop?.optStringOrNull("name") ?: conn?.shopName.orEmpty(),
             shopAddress = shop?.optStringOrNull("address") ?: conn?.shopAddress.orEmpty(),
             shopPhone = shop?.optStringOrNull("phone") ?: "",
+            systemName = system?.optStringOrNull("name") ?: conn?.systemName.orEmpty(),
             adminName = adminName,
             adminEmail = adminEmail,
             adminCode = adminCode,
@@ -415,9 +510,9 @@ class Api(private val prefs: Prefs) {
     }
 
     fun emailStats(shopId: String): EmailStats {
-        val r = call("connectx/gateway/emails/stats?utcOffsetMinutes=${localOffsetMinutes()}", token = deviceToken(shopId))
+        val r = call("device/emails/stats?utcOffsetMinutes=${localOffsetMinutes()}", token = deviceToken(shopId))
         if (!r.has("sent") || !r.has("failed") || !r.has("pending"))
-            throw IllegalStateException("EMS did not return email statistics. Update the EMS server.")
+            throw IllegalStateException("ConnectX Control did not return email statistics. Update the ConnectX Control deployment.")
         return EmailStats(
             sent = r.getInt("sent"),
             failed = r.getInt("failed"),
@@ -429,11 +524,11 @@ class Api(private val prefs: Prefs) {
     fun emailPage(shopId: String, page: Int, snapshot: String = ""): EmailPage {
         require(page >= 0) { "Invalid email page." }
         val suffix = if (page == 0) "" else "&snapshot=${URLEncoder.encode(snapshot, "UTF-8")}"
-        val r = call("connectx/gateway/emails?page=$page$suffix", token = deviceToken(shopId))
+        val r = call("device/emails?page=$page$suffix", token = deviceToken(shopId))
         val arr = r.optJSONArray("items")
-            ?: throw IllegalStateException("EMS did not return email history. Update the EMS server.")
+            ?: throw IllegalStateException("ConnectX Control did not return email history. Update the ConnectX Control deployment.")
         val anchor = r.optStringOrNull("snapshot")
-            ?: throw IllegalStateException("EMS did not return an email history snapshot.")
+            ?: throw IllegalStateException("ConnectX Control did not return an email history snapshot.")
         return EmailPage(
             items = (0 until arr.length()).map { arr.getJSONObject(it).toEmailItem() },
             page = r.getInt("page"),
@@ -444,11 +539,11 @@ class Api(private val prefs: Prefs) {
 
     fun emailDetail(shopId: String, emailId: String): EmailItem {
         require(Regex("[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}").matches(emailId)) { "Invalid email ID." }
-        return call("connectx/gateway/emails/$emailId", token = deviceToken(shopId)).toEmailItem()
+        return call("device/emails/$emailId", token = deviceToken(shopId)).toEmailItem()
     }
 
     fun activity(shopId: String, range: String): List<ActivityItem> {
-        val r = call("connectx/gateway/activity?range=$range&utcOffsetMinutes=${localOffsetMinutes()}", token = deviceToken(shopId))
+        val r = call("device/activity?range=$range&utcOffsetMinutes=${localOffsetMinutes()}", token = deviceToken(shopId))
         val arr = r.optJSONArray("items") ?: JSONArray()
         return buildList {
             for (i in 0 until arr.length()) {
@@ -478,31 +573,31 @@ class Api(private val prefs: Prefs) {
     }
 
     fun disconnect(shopId: String) {
-        runCatching { call("connectx/gateway/disconnect", "POST", JSONObject(), deviceToken(shopId)) }
+        runCatching { call("device/disconnect", "POST", JSONObject(), deviceToken(shopId)) }
         prefs.removeConnection(shopId)
     }
 
-    /** Public EMS endpoint; the server compares with our installed Gradle build code.
+    /** Public ConnectX release endpoint; the server compares with our installed Gradle build code.
      * Never convert HTTP/network/invalid-response failures to "up to date". */
     fun checkUpdate(packageName: String, installedVersionCode: Int): AppUpdateInfo {
         val pkg = URLEncoder.encode(packageName, "UTF-8")
         val req = Request.Builder()
-            .url(url("app-store/check-update?package=$pkg&versionCode=$installedVersionCode"))
+            .url(url("public/releases/check?package=$pkg&versionCode=$installedVersionCode"))
             .header("Cache-Control", "no-cache")
             .get().build()
         execute(req).use { res ->
             val raw = res.body?.string().orEmpty()
             val obj = runCatching { JSONObject(raw) }.getOrNull()
             if (!res.isSuccessful) {
-                throw IllegalStateException(obj?.optStringOrNull("error") ?: "EMS App Store returned HTTP ${res.code}.")
+                throw IllegalStateException(obj?.optStringOrNull("error") ?: "ConnectX release server returned HTTP ${res.code}.")
             }
             if (obj == null || !obj.optBoolean("ok", false))
-                throw IllegalStateException("EMS App Store returned an invalid update response.")
+                throw IllegalStateException("ConnectX release server returned an invalid update response.")
             val code = obj.optInt("versionCode", obj.optInt("version_code", 0))
             val version = obj.optStringOrNull("latestVersion") ?: obj.optStringOrNull("version")
             val download = obj.optStringOrNull("downloadUrl") ?: obj.optStringOrNull("download_url")
             if (code <= 0 || version.isNullOrBlank() || download.isNullOrBlank())
-                throw IllegalStateException("EMS App Store release metadata is incomplete. Ask the EMS owner to publish a real APK.")
+                throw IllegalStateException("ConnectX release metadata is incomplete. Ask the platform owner to publish a real APK in ConnectX Control → App Releases.")
             val fullUrl = if (download.startsWith("https://") || download.startsWith("http://"))
                 download else url("").removeSuffix("api/") + download.trimStart('/')
             return AppUpdateInfo(

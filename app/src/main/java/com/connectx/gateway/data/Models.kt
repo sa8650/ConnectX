@@ -1,4 +1,13 @@
-package com.ems.connectx.data
+package com.connectx.gateway.data
+
+/** An external system listed by the ConnectX website for the sign-in dropdown
+ * (GET device/systems). The app never sees or stores the system's API URL -
+ * ConnectX proxies the administrator login server-side. */
+data class SystemOption(
+    val key: String,
+    val name: String,
+    val available: Boolean
+)
 
 data class Shop(
     val id: String,
@@ -6,6 +15,7 @@ data class Shop(
     val address: String = "",
     val phone: String = "",
     val shopCode: String = "",
+    val category: String = "",
     val connected: Boolean = false
 )
 
@@ -13,6 +23,8 @@ data class Connection(
     val shopId: String,
     val shopName: String,
     val shopAddress: String,
+    val systemKey: String = "",
+    val systemName: String = "",
     val adminId: String,
     val adminEmail: String,
     val adminName: String,
@@ -63,8 +75,9 @@ data class ActivityItem(
     val invoiceId: String? = null
 )
 
-// Email is already sent by EMS; the Android device reads this shop's outgoing
-// history only. No mailbox credentials or email-sending permission live here.
+// Email is sent by the client apps (EMS, CareOS, ...); the Android device reads
+// this shop's outgoing history from ConnectX only. No mailbox credentials
+// or email-sending permission live here.
 data class EmailItem(
     val id: String,
     val subject: String,
@@ -103,9 +116,10 @@ data class HomeStats(
     val shopName: String = "",
     val shopAddress: String = "",
     val shopPhone: String = "",
+    val systemName: String = "",
     val adminName: String = "",
     val adminEmail: String = "",
-    val adminCode: String = "",
+    val adminCode: String = "",  
     val adminPhone: String = "",
     val adminAddress: String = "",
     val adminCreatedAt: String = "",

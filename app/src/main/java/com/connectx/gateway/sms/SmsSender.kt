@@ -1,4 +1,4 @@
-package com.ems.connectx.sms
+package com.connectx.gateway.sms
 
 import android.app.PendingIntent
 import android.content.Context
@@ -9,7 +9,7 @@ import android.telephony.SubscriptionInfo
 import android.telephony.SubscriptionManager
 
 object SmsSender {
-    const val ACTION_SENT = "com.ems.connectx.SMS_SENT"
+    const val ACTION_SENT = "com.connectx.gateway.SMS_SENT"
     const val EXTRA_JOB = "jobId"
     const val EXTRA_SHOP = "shopId"
     const val EXTRA_PART = "part"

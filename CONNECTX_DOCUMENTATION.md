@@ -1,360 +1,293 @@
 # ConnectX: Central Communication Gateway powered by Dexter Studio
-## Complete Technical Documentation & Architecture Reference
+
+## Complete Technical Documentation & Architecture Reference — v2.1.0 (systems + shops)
 
 ---
 
-## 1. Executive Summary & Architectural Overview
+## 1. Executive summary & architecture
 
-**ConnectX** is the EMS Android companion for local SIM-based SMS dispatch **and read-only access to the paired shop's outgoing EMS ConnectX email history**. The app is branded **ConnectX: Central Communication Gateway powered by Dexter Studio** (short launcher label: ConnectX). It does not fetch incoming mailbox mail or compose/send email on Android; use the EMS shop website to send email.
+ConnectX is an **independent communication platform**. It consists of:
 
-For SMS, ConnectX claims queued transaction messages from EMS and sends them using the selected physical SIM. For email, the paired device token permits **read-only, shop-scoped** access to existing `connectx_messages`; the EMS server retains Brevo credentials and rejects revoked/inactive devices. Email HTML is converted to inert text on Android, not executed in a WebView. SMS still works in the background while the Email page is closed.
+1. **ConnectX Control** — a React website + Cloudflare Pages Functions API + D1 database
+   (separate project: `connectx-control/`, deployed to its own repo/site — officially
+   `https://connectxweb.pages.dev`). It is the single source of truth for **systems**
+   (EMS, InfluenceOS, CareOS, PlugX, custom), their **shops**, federated **system
+   administrators**, gateway devices, message jobs, API keys, releases and settings.
+2. **ConnectX Android gateway** — this repository. A native Kotlin + Jetpack Compose app
+   (package `com.connectx.gateway`) for **system administrators**. It signs in through
+   ConnectX, pairs the phone to one of the administrator's shops, claims queued SMS jobs,
+   dispatches them through the phone's selected SIM with `SmsManager`, reports results,
+   and shows read-only outgoing email history for that shop — pushed by client systems or
+   delivered by the platform's own email gateway (Brevo/Resend/SendGrid/Mailgun/Postmark
+   configured in ConnectX Control).
+
+**The phone talks only to ConnectX Control.** The app never reads a system URL, system
+session or system database; the official ConnectX Control address is **built into the
+app core** (`GatewayUrl.BUILT_IN`). The URL entry screen appears only when that address
+cannot be reached. EMS — like CareOS, InfluenceOS and PlugX — is an external *client
+system* that integrates through the ConnectX **Client API** with a revocable API key.
+The EMS repository is not modified by this redesign.
 
 ```
-┌────────────────────────────────────────────────────────────────────────┐
-│                              EMS CLOUD / POS                           │
-│  - Point of Sale Checkout (Sales, Dues, Returns, Exchanges, Payments)  │
-│  - SMS queue + outgoing email history (connectx_sms_messages,           │
-│    connectx_messages)                                                   │
-│  - Official App Store & APK Release Distribution (Cloudflare R2)       │
-│  - Administrator Console & Token Issuance                              │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │ HTTPS (Bearer Device / Admin Token)
-                                    ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│                     CONNECTX ANDROID GATEWAY ENGINE                    │
-│                                                                        │
-│  ┌───────────────────────┐  ┌───────────────────────────────────────┐  │
-│  │   UI & DESIGN SYSTEM  │  │         BACKGROUND SERVICES           │  │
-│  │  - Pure White Light   │  │  - GatewayService (Foreground)        │  │
-│  │  - Azure Blue Accent  │  │  - QueueProcessor (Periodic Drain)    │  │
-│  │  - SMS & Email tabs   │  │  - QueueWorker (WorkManager 15m)      │  │
-│  │  - BackHandler Nav    │  │  - BootReceiver (Auto-restart)        │  │
-│  │  - Dedicated About    │  │  - SmsSentReceiver (Multipart ACK)    │  │
-│  │  - In-App APK Modal   │  │  - FileProvider Package Installer     │  │
-│  └───────────────────────┘  └───────────────────────────────────────┘  │
-│                                   │                                    │
-│  ┌────────────────────────────────┴─────────────────────────────────┐  │
-│  │                HARDWARE TELEPHONY & TELECOM STACK                │  │
-│  │  - SubscriptionManager (Multi-SIM Detection & Slot Mapping)      │  │
-│  │  - SmsManager (Multipart SMS Division & Broadcast Intents)       │  │
-│  │  - EncryptedSharedPreferences (AES-256-GCM Keystore Storage)     │  │
-│  └──────────────────────────────────────────────────────────────────┘  │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │ GSM / LTE / 5G Cellular Radio
-                                    ▼
-                      ┌───────────────────────────┐
-                      │    CUSTOMER MOBILE PHONE  │
-                      └───────────────────────────┘
+Client systems (EMS, CareOS, InfluenceOS, PlugX, …)
+    │  POST /api/client/v1/sms         X-ConnectX-Key: cxk_live_… + "shop"
+    │  POST /api/client/v1/email/send  (ConnectX delivers via its configured provider)
+    │  POST /api/client/v1/email       (or just log history when the system sends its own)
+    │  ◄── webhooks: job.sent / job.failed / job.cancelled (HMAC-signed)
+    ▼
+ConnectX Control  (Cloudflare Pages: React SPA + Functions + D1 + R2)
+    │  control API   /api/control/*    (owner/operator bearer sessions — the website)
+    │  device API    /api/device/*     (admin sessions + revocable device tokens cxd_…)
+    │  public API    /api/public/*     (release check/download — no auth)
+    │  ── server-side only ──►  system APIs (owner-configured per system):
+    │       POST {api_url}/{login_path}   federated administrator login
+    │       GET  {api_url}/{shops_path}   administrator's shop list (sync)
+    ▼
+Android gateway phones (this app)
+    system dropdown → admin login → shop select → SIM → claim → send via SIM → report
 ```
 
+### Multi-product model
+
+- **System** — an external product registered in ConnectX Control (`ems`, `careos`,
+  `influenceos`, `plugx`, custom). The **owner** configures its `api_url` (federated
+  admin login + shop sync), `login_path`, `shops_path` and `webhook_url`. Systems own
+  API keys. The API URL is **never exposed to the phone** — `device/systems` returns only
+  key/name/available.
+- **Administrator** — a system admin (e.g. an EMS administrator) who signs in on a phone.
+  Credentials are verified **server-side** by ConnectX against the system's own login
+  endpoint; the returned system token is cached in `cx_admins` (short-lived, re-login on
+  demand). No system password ever reaches the phone or ConnectX storage.
+- **Shop** — a shop/branch inside a system (`cx_shops`, unique per system+external id).
+  Shops sync automatically at administrator sign-in and can be auto-registered by the
+  Client API (`shop` + `shop_name`). Devices pair to a shop; jobs are scoped to it.
+- **API key** — `cxk_live_…`, SHA-256-hashed at rest, bound to one system, with a daily
+  message limit. Shown exactly once at creation.
+- **Job** — a unified message row (`cx_jobs`) with `channel` = `sms` or `email`,
+  `system_id`, `shop_id`, opaque `reference_id` / `reference_number` passthrough fields
+  and an idempotency key. Statuses: `queued → sending → sent | failed | cancelled`.
+- **Device** — a paired phone with an opaque `cxd_…` token (hash stored), status
+  `pending_test → active`, revocable at any time from the website.
+
+### Security model
+
+| Concern | Mechanism |
+|---|---|
+| Website sessions | HMAC-SHA256 signed bearer tokens (HS256 JWT-like), 12 h, `SESSION_SECRET` |
+| Admin (phone) sessions | ConnectX-issued tokens after **federated** verification through the system API; the phone never contacts the system |
+| System credentials | Verified server-side only; the cached system token (`cx_admins.system_token`) expires with the system's own session; no passwords stored |
+| Passwords (console) | PBKDF2-SHA256, 100 000 iterations, random salt (`pbkdf2$…` format) |
+| Device tokens | Opaque 256-bit random `cxd_…`; only SHA-256 hash stored; instant revoke |
+| API keys | Opaque `cxk_live_…`; only SHA-256 hash stored; per-key daily limit; system-bound |
+| Pairing | Short-lived ambiguous-character-free codes (`4F7K-9Q2M`), single use, per shop |
+| Client API aliases | snake_case + EMS-style camelCase (`storeId`, `toPhone`, `messageBody`, `idempotencyKey`, …); `POST client/v1/sms/send` alias; 5-second duplicate guard |
+| Claim races | Conditional `UPDATE … WHERE status='queued'`; stale `sending` jobs (10 min) re-queue |
+| Webhooks | HTTPS-only, private-IP blocked, optional `x-connectx-signature` HMAC |
+| Email privacy | Device reads its shop's history only; HTML shown as inert text; no disk cache |
+| APK updates | ZIP-magic + package/build verification before install; Android checks signature |
+| Built-in control URL | `https://connectxweb.pages.dev` compiled into the app; custom URLs only via the explicit connect screen |
+
 ---
 
-## 2. Design System & UI Architecture (Mobbin Light Theme)
-
-ConnectX utilizes a **Clean Modern Light Theme** built with Jetpack Compose and Material 3, inspired by top fintech and utility apps on Mobbin (Linear, Stripe, Revolut).
-
-### 2.1 Color Palette
-
-| Token | Hex / Value | Usage |
-| :--- | :--- | :--- |
-| **PureWhite** | `#FFFFFF` | Main background canvas, cards, modal sheets, status bar. |
-| **PearlBg** | `#F8FAFC` | Secondary container surface, input field fill, skeleton base. |
-| **PearlSurface** | `#F1F5F9` | Elevated badges, button hover states, divider backgrounds. |
-| **PearlElevated** | `#E2E8F0` | Subtle elevation layers, interactive button containers. |
-| **PrimaryBlue** | `rgb(35, 131, 226)` (`#2383E2`) | Primary brand accent, CTA buttons, active tab indicators, focus rings. |
-| **PrimarySubtle** | `#EFF6FF` | Selected card container, subtle badge backgrounds. |
-| **BorderSubtle** | `#E2E8F0` | 1dp clean card borders, list dividers. |
-| **BorderMedium** | `#CBD5E1` | Enhanced card borders, inactive step indicators. |
-| **TextPrimary** | `#0F172A` | Deep slate high-contrast headings, titles, active labels. |
-| **TextSecondary** | `#475569` | Cool slate body text, subtitles, descriptions. |
-| **TextMuted** | `#94A3B8` | Timestamps, placeholders, inactive hints. |
-| **AccentEmerald** | `#059669` / `#ECFDF5` | "Sent" status, "Online" indicator, Sales Invoice badges. |
-| **AccentAmber** | `#D97706` / `#FFFBEB` | "Queued" / "Pending" status, Due Invoice Reminder badges. |
-| **AccentRose** | `#DC2626` / `#FEF2F2` | "Failed" / "Cancelled" status, destructive actions. |
-| **AccentPurple** | `#7C3AED` / `#F5F3FF` | Exchange Invoice Confirmation badges. |
-| **AccentCyan** | `#0891B2` / `#ECFEFF` | Return Invoice Confirmation badges. |
-
-### 2.2 Core UI Components
-
-- **`AppCard`**: Solid white/pearl surface card with 1dp border (`BorderSubtle`), rounded corners (14–18dp), and optional ripple click handling. Completely eliminates frosted glass / blur artifacts.
-- **`StatusPill`**: Compact pill chip with colored status dot (Emerald, Amber, Rose) and semantic typography.
-- **`MessageTypeBadge`**: Distinct category tag styled specifically for transaction types.
-- **`ConnectXLoader`**: High-performance dual-ring circular progress spinner in primary Azure Blue (`rgb(35, 131, 226)`).
-- **`ShimmerBox`**: Linear gradient animated shimmer skeleton for smooth loading states on activity feeds and shop lists.
-- **`modernFieldColors()`**: Outlined text field styling with pearl background (`#F8FAFC`), crisp focus border (`#2383E2`), and clear labels.
-
----
-
-## 3. Navigation & System Back Gesture Engine (`BackHandler`)
-
-ConnectX integrates Jetpack Compose `BackHandler` at the root application level (`AppRoot`), ensuring the native Android system back gesture and navigation buttons navigate hierarchical sub-screens safely rather than immediately terminating the app:
-
-### 3.1 Screen Hierarchy & Back Stack Rules
+## 2. Android app structure (this repository)
 
 ```
-Dashboard / Login (Tab 0) ───[Back]───► Requires 2nd back press within 2s to exit app
-       │
-       ├──► SMS (Tab 1) ────────────[Back]───► Dashboard (Tab 0)
-       │     (SIM switch/balance and SMS history)
-       │
-       ├──► Email (Tab 2) ─────────[Back]───► Dashboard (Tab 0)
-       │     (selected shop's outgoing EMS history, read-only)
-       │
-       ├──► Settings (Tab 3) ───────[Back]───► Dashboard (Tab 0)
-       │         │
-       │         └──► About & Updates Screen ───[Back]───► Settings (Tab 3)
-       │
-       └──► Shop Pairing Wizard
-                 ├──► Shop List Screen ───[Back]───► Settings / Login
-                 ├──► Permissions Screen ───[Back]───► Shop List Screen
-                 ├──► SIM Setup Screen ───[Back]───► Permissions Screen
-                 ├──► Device Registration ───[Back]───► SIM Setup Screen
-                 └──► Test SMS Screen ───[Back]───► Dashboard (Tab 0)
+app/src/main/java/com/connectx/gateway/
+├── MainActivity.kt          # Compose UI: system dropdown + federated login, shop select,
+│                            # SIM setup, test SMS, dashboard, SMS/Email pages, settings,
+│                            # About & Updates + OTA wizard, pairing-code flow
+├── ConnectXApp.kt           # Application: notification channels, workers scheduling
+├── data/
+│   ├── Api.kt               # HTTPS client for the ConnectX device API (OkHttp + JSON)
+│   ├── GatewayUrl.kt        # Built-in control URL + strict validator/normalizer
+│   ├── Prefs.kt             # EncryptedSharedPreferences: base URL, system, tokens, connections
+│   ├── Models.kt            # Data classes (SystemOption, Shop, Connection, SmsJob, EmailItem…)
+│   ├── SimBalance.kt        # Owner-managed carrier balance config + reply parsing
+│   └── UpdateCheckWorker.kt # Periodic background update check (WorkManager)
+├── sms/
+│   ├── GatewayService.kt    # Foreground service keeping dispatch alive
+│   ├── QueueProcessor.kt    # claim → send → report loop
+│   ├── QueueWorker.kt       # WorkManager fallback pump
+│   ├── SmsSender.kt         # SmsManager send on the selected SIM subscription
+│   ├── SmsSentReceiver.kt   # delivery result → report to ConnectX
+│   ├── SimUssdClient.kt     # single manual USSD balance request (CALL_PHONE)
+│   └── BootReceiver.kt      # restart gateway after reboot
+└── ui/Theme.kt              # Mobbin-light design system
 ```
 
-### 3.2 Modal & Lock Screen Dismissal
-- If the **In-App Installation Wizard** modal is currently open, pressing back dismisses the modal without closing the current activity.
-- If a **Mandatory Update Lock** is active, normal screen navigation is blocked and the user is prompted to press back twice if they intend to exit.
+Gradle identity: `namespace`/`applicationId` = `com.connectx.gateway`, versionName `2.1.0`,
+versionCode `19`. The About screen reads these from `BuildConfig`.
+
+### Design system (Mobbin Light)
+
+Unchanged: light surfaces (`#F7F8FA` background, white cards, 16–28 dp radii),
+indigo primary `#4F46E5`-family accents, `Inter`-style system typography, bottom navigation
+with Dashboard / SMS / Email / Settings, predictive back handling, inert-HTML email viewer.
+The Control website mirrors the same brand (indigo→cyan gradient, dark navigation rail).
 
 ---
 
-## 3.3 Dashboard, SMS balance and Email history
+## 3. Device API (used by this app)
 
-The dashboard shows the active shop and **both SMS and email sent/pending/failed figures** with the latest outgoing email; it has no SIM switch or USSD button. Administrator Profile and Send a Test SMS remain in **Settings**. The **SMS page** holds the sending-SIM switch and SIM Balance card. The card detects the selected sending SIM's MCC/MNC (fallback: exact Android carrier name) and displays a masked number. On **Refresh**, it reads one owner-managed EMS balance code, requests `CALL_PHONE` permission if necessary, and makes **one** USSD request through `TelephonyManager.createForSubscriptionId(...).sendUssdRequest(...)` on the selected SIM, not the default calling SIM. Unknown, disabled, denied, timed-out, negative, ambiguous, or unparseable results display **“Balance unavailable”**. No dial codes or live balances are hard-coded, no raw replies are sent to EMS, and there is no SMS-quota query or counter. The authenticated device route remains `GET /api/connectx/gateway/sim-carrier`. See `EMS/SIM_BALANCE_SETUP.md`.
+Base URL = the built-in `https://connectxweb.pages.dev` (or the saved custom address).
+All paths are under `/api/`.
 
-The **Email page** loads 30 outgoing messages at a time for the active shop and provides **Load older emails**. Records show status, recipient, subject, date and provider error; opening one fetches its full body and To/CC/BCC details. The Android app does not load remote images or scripts from email HTML.
+### 3.1 System list, federated sign-in & pairing
 
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `GET  device/systems` | — | `{systems:[{id,key,name,available}]}` — the sign-in dropdown. Never exposes API URLs. |
+| `POST device/auth/login` | — | `{system:"ems", email, password}` → ConnectX verifies against the system's API → `{token, admin, administrator, system, shops:[…]}` |
+| `GET  device/shops` | admin | Re-sync + `{administrator, system, shops:[{id,external_id,name,shop_code,address,phone,category,status,connected,devices}]}` |
+| `POST device/register` | admin | `{shopId, deviceName, androidVersion, appVersion, simSubscriptionId, simCarrier, phoneNumber}` → `{device, deviceToken, shop, system, administrator}` |
+| `POST device/pair` | — | Pairing-code flow `{code, deviceName, …}` → same shape (administrator may be null) |
 
----
+The administrator's shops sync from the system on every login and on `device/shops`;
+unknown shops seen by the Client API are auto-registered and appear here too.
 
-## 4. Dedicated "About & Updates" Screen
+### 3.2 Paired-device routes (bearer `cxd_…`)
 
-ConnectX features a clean, dedicated **About & Updates** screen accessible from Settings:
+| Endpoint | Purpose |
+|---|---|
+| `GET  device/me` | Device + shop + system + administrator + connected shop ids |
+| `POST device/heartbeat` | Liveness (`last_seen`), optional name/version patch, `smsEnabled` flag |
+| `POST device/jobs/claim` | Claim up to N queued SMS **of this device's shop** (race-safe; re-queues stale sends) |
+| `POST device/jobs/report` | `{jobId, status:"sent"|"failed", error?}` → fires the system's webhook |
+| `POST device/jobs/cancel` | Cancel a still-queued job (409 when already claimed) |
+| `DELETE device/jobs/{id}` | Same as cancel (id in path) |
+| `POST device/test` | Mark setup test passed/failed; optionally queue a real test SMS |
+| `PATCH device/sim` | Update selected SIM subscription/carrier/phone |
+| `GET  device/sim-carrier?mccMnc&carrierName` | Owner-managed balance USSD lookup → `{supported, carrier}` |
+| `GET  device/stats?utcOffsetMinutes` | Today's sent/failed/pending + last activity + shop/system/administrator blocks |
+| `GET  device/activity?range=today|7d|30d` | Last 250 SMS rows with reference numbers |
+| `GET  device/emails?page&snapshot` | Paginated (30/page) outgoing email history of the shop, snapshot-stable |
+| `GET  device/emails/stats` | Email counters + latest item |
+| `GET  device/emails/{uuid}` | Full detail incl. bcc/custom_body/body_html (inert rendering) |
+| `POST device/disconnect` | Self-revoke this device |
 
-- **Installed identity and server update metadata**: local resources provide the installed brand/description; EMS App Store provides the available update details:
-  - Installed app identity from local resources: **ConnectX: Central Communication Gateway powered by Dexter Studio** (never overwritten by an older App Store listing).
-  - Installed Version & Build from Gradle (`v1.6.0`, `Build 17`).
-  - Target Android Platform (`Android 8.0+`)
-  - Latest App Store Version & Build (for example, `v1.6.0`, `Build 17`, when that signed APK is published)
-  - Binary Package Size (`8.2 MB`)
-  - Release / Update Date
-  - Formatted Release Notes / Changelog
-- **Package Name Isolation**: Technical package names (e.g., `com.ems.connectx`) are completely hidden from the user interface to ensure a polished consumer presentation.
-- **On-Demand Update Checker**: Tapping "Check for Updates" queries the EMS App Store endpoint (`/api/app-store/check-update?package=com.ems.connectx`) in real time with loader animations and Toast feedback.
+Job payload keys returned by `claim`: `id, shop_id, shop_external_id, system_key,
+phone_number, message, event_type, message_type, recipient_name, invoice_id,
+reference_id, reference_number, created_at, attempts`.
 
----
+### 3.3 Public update channel (no auth)
 
-## 5. In-App Automatic Installation Wizard (OTA Updates)
+| Endpoint | Purpose |
+|---|---|
+| `GET public/releases/check?package&versionCode` | `{ok, hasUpdate, latestVersion, versionCode, mandatory, downloadUrl, apk_filename, apk_size_bytes, releaseNotes, updated_at}` |
+| `GET public/releases/download/{package}` | Signed APK from ConnectX R2 (or 302 to a vetted external HTTPS URL) |
+| `GET public/releases` / `GET public/health` | Listing / liveness |
 
-ConnectX includes an automated, step-by-step Over-The-Air (OTA) APK download and installation wizard:
-
-### 5.1 Update Flow Architecture
-
-```
-┌────────────────────────────────────────────────────────┐
-│ 1. VERSION DETECTION                                   │
-│    App queries /api/app-store/check-update             │
-│    Compares server versionCode (e.g., 15) > 14         │
-└──────────────────────────┬─────────────────────────────┘
-                           │
-                           ▼
-┌────────────────────────────────────────────────────────┐
-│ 2. IN-APP DOWNLOAD WIZARD MODAL                        │
-│    Streams APK byte buffer via OkHttpClient            │
-│    Calculates downloaded bytes & percentage progress   │
-│    Saves binary safely to Context.cacheDir/updates/    │
-└──────────────────────────┬─────────────────────────────┘
-                           │
-                           ▼
-┌────────────────────────────────────────────────────────┐
-│ 3. FILEPROVIDER & PERMISSIONS                          │
-│    Verifies REQUEST_INSTALL_PACKAGES permission        │
-│    Generates content:// URI via FileProvider           │
-│    Grants FLAG_GRANT_READ_URI_PERMISSION to Installer  │
-└──────────────────────────┬─────────────────────────────┘
-                           │
-                           ▼
-┌────────────────────────────────────────────────────────┐
-│ 4. ANDROID SYSTEM PACKAGE INSTALLER                    │
-│    Dispatches Intent.ACTION_VIEW with APK MIME type    │
-│    Prompts standard Android "Update this app?" UI      │
-└────────────────────────────────────────────────────────┘
-```
-
-### 5.2 Mandatory Update Screen Enforcement
-When an EMS Owner marks a release as `mandatory = true`:
-- The application displays a fullscreen, blocking **Mandatory Update Screen**.
-- Normal tabs and features are locked until the user installs the update.
-- Users can click **Install Update Now** to immediately initiate the automated download wizard.
+Update flow: launch + resume + hourly while open + ~6-hourly WorkManager check. Mandatory
+releases block the UI until installed. Downloaded APKs are verified for size, ZIP magic,
+package name and advertised build code before handing to the package installer; Android
+still enforces the signing certificate.
 
 ---
 
-## 6. Message Types & Smart Formatting
+## 4. Client API (for EMS, CareOS, InfluenceOS, PlugX, …)
 
-ConnectX parses and formats all incoming SMS jobs into clear human-readable titles, replacing any missing or `"null"` strings:
+Header: `X-ConnectX-Key: cxk_live_…`. Every message carries a **`shop`** reference (the
+shop's id inside the system, its ConnectX uuid, or its shop_code); unknown shops are
+auto-registered (pass `shop_name`). Full reference with examples lives in the Control
+website's **API Docs** page and `connectx-control/API.md`.
 
-```kotlin
-fun formatMessageType(type: String?, eventType: String?, messageBody: String?): String
-```
+| Endpoint | Purpose |
+|---|---|
+| `GET  client/v1/ping` | Validate key, list reachable gateways |
+| `POST client/v1/sms` | Queue one SMS for a shop (body or template `event_type` + amounts) |
+| `POST client/v1/sms/bulk` | ≤100 messages per call |
+| `GET  client/v1/sms[/{id}]` | Status/list; `POST …/{id}/cancel` while queued |
+| `POST client/v1/email/send` | ConnectX delivers the email through the provider configured in Settings → Email (no SMTP setup needed in the system) |
+| `POST client/v1/email` | Log an outgoing email record (status passthrough) |
+| `PATCH client/v1/email/{id}` | Update email status/error/provider id |
+| `GET  client/v1/stats` / `client/v1/devices` | Today counters / online gateways (per shop) |
+| webhooks | `job.sent`, `job.failed`, `job.cancelled` POSTed to the system's HTTPS webhook with `system_key` + `shop_external_id` |
 
-| Message Type | Badge Color | Triggering Event in EMS |
-| :--- | :--- | :--- |
-| **Sales Invoice Confirmation** | Emerald (`#059669`) | Customer makes a purchase at POS checkout. |
-| **Due Invoice Reminder** | Amber (`#D97706`) | Outstanding credit/due invoice balance notification. |
-| **Exchange Invoice Confirmation** | Purple (`#7C3AED`) | Item exchange processed with net settlement. |
-| **Return Invoice Confirmation** | Cyan (`#0891B2`) | Item return and cash/account refund issued. |
-| **Payment Confirmation** | Azure Blue (`#2383E2`) | Due recovery or partial payment received. |
-| **Gateway Test Message** | Slate (`#475569`) | Hardware verification test triggered from app. |
-| **Custom Message** | Azure Blue (`#2383E2`) | Manual customer or supplier communication. |
-
----
-
-## 7. Queued SMS Management & Cancellation Engine
-
-Users can monitor the live outgoing SMS queue and cancel pending messages before they are transmitted:
-
-1. **Visual Cue**: Messages with status `queued`, `pending`, or `sending` display a prominent red **Cancel** button on the card and in the detail modal sheet.
-2. **Confirmation Safety**: Clicking Cancel triggers a confirmation `AlertDialog` detailing recipient name, phone number, and message type.
-3. **API Execution**: Calls `Api.cancelJob(shopId, jobId)`:
-   - Primary: `POST /api/connectx/gateway/cancel` (with device token)
-   - Fallback: `DELETE /api/connectx/sms/messages/:id` (with admin token)
-4. **Local Exclusion**: `QueueProcessor` immediately checks `prefs.isCancelled(job.id)` before invoking `SmsSender`, preventing race conditions.
-5. **Confirmed UI feedback**: only an EMS-confirmed deletion removes the job from the SMS page. A network error or a job already being sent is shown as a cancellation failure; it must never be reported as successfully cancelled.
+Templates: the platform defines `SALE, PAYMENT, DUE_REMINDER, RETURN, EXCHANGE, REFUND,
+TEST` templates (placeholders `{name} {shop} {invoice} {total} {paid} {due} {amount}
+{currency}`; `{shop}` renders the shop's name); systems may send only `event_type` +
+amount fields and ConnectX renders them.
 
 ---
 
-## 8. Administrator Profile Section & Sync
+## 5. Control website (connectx-control project)
 
-Settings includes a dedicated **Administrator Profile Hero Card** and **Profile Details Modal**:
+React 18 + TypeScript + Vite SPA served by the same Cloudflare Pages deployment as the API.
+Pages: Dashboard · Gateways (per-shop pairing codes, revoke, primary) · Messages (shop/system
+filters, cancel, retry, manual test send) · **Shops** (synced per system; pause/resume) ·
+**Systems & API Keys** (System | API URL | Status table, configure login/shops paths +
+webhook, keys shown once, limits) · App Releases (APK upload to R2 or external URL,
+publish/mandatory toggles) · SIM Carriers · API Docs · Activity (audit trail) · Settings
+(profile, password, global SMS toggle + templates, email provider, platform accounts).
 
-- **Administrator Short ID**: Displays the authentic Short ID / Admin Code (e.g., `#1001` or `ADMIN-1001`) issued by EMS.
-- **Full Name & Verification**: Shows administrator name with verified badge.
-- **Contact Details**: Real registered phone number and business address.
-- **Account Status**: Real-time status (`Active Administrator`).
-- **Server & Infrastructure**: EMS URL, active connected shops count, hardware device public ID (`CX-XXXXXXXXXX`), and active SIM details.
-- **Live Sync Button**: Top-right refresh button calls `Api.fetchAdminProfile()` to update credentials from EMS on demand.
+Roles: **owner** (everything: systems, API URLs, keys, releases, accounts) and **operator**
+(day-to-day: shops, gateways, messages, carriers).
 
----
-
-## 9. Official EMS App Store Integration
-
-### 9.1 App Store Card Aesthetic
-The EMS Administrator App Store displays all ecosystem applications with a clean, focused card presentation:
-- Clean 64px rounded squircle application icons with soft drop shadows.
-- Direct display of App Title, Release Version, Package Size, and Published Date.
-- Zero extraneous star rating pills or arbitrary category tags.
-- Dynamic SVG and CSS gradient fallback badges preventing empty card headers.
-
-### 9.2 Owner Console Release Publisher
-The EMS Owner Console includes complete tools for publishing and managing ecosystem applications:
-- **1-Click Presets**: Pre-configured templates for *ConnectX: Central Communication Gateway powered by Dexter Studio*, *EMS Mobile POS Terminal*, and *EMS Inventory Scanner*.
-- **Quick Version Bumpers**: 1-click `[+0.0.1 Patch]`, `[+0.1.0 Minor]`, and `[+1.0.0 Major]` buttons that automatically recalculate semantic versions and increment `version_code`.
-- **Cloudflare R2 Binary Storage**: Direct binary APK and icon uploads to Cloudflare R2 bucket storage with live upload progress tracking.
-- **Mandatory Update Toggle**: One-click switch to flag security-critical releases as required across the entire Android fleet.
+First run: the login page detects an uninitialized platform and creates the owner account
+and seeds the four known systems (EMS, CareOS, InfluenceOS, PlugX) — all *unconfigured*
+until the owner sets their API URLs. There is no workspace concept.
 
 ---
 
-## 10. Complete API Endpoint Reference
+## 6. Queued SMS management & cancellation
 
-ConnectX communicates with EMS via standard REST JSON APIs:
+- Claiming is conditional: `UPDATE … SET status='sending' WHERE id=? AND status='queued'`;
+  a job is dispatched only when this device won the update (prevents double-send across
+  multiple gateways in one shop).
+- Jobs stuck `sending` for >10 minutes are re-queued automatically on the next claim.
+- Cancellation (phone, website or client API) only succeeds while `queued`; the guarded
+  update returns 409 if a gateway claimed it meanwhile.
+- `report` is idempotent-friendly: a `sent` job owned by another device returns
+  `{ok, duplicate:true}` instead of overwriting.
+- Retries: failed/cancelled SMS can be re-queued from the website (raises `max_attempts`).
 
-### 10.1 App Store & In-App Update API
-| Method | Endpoint | Description | Payload / Response |
-| :--- | :--- | :--- | :--- |
-| `GET` | `/api/app-store/check-update?package=...` | Checks latest published version. | Responds: `{ ok: true, hasUpdate: true, latestVersion: "1.6.0", versionCode: 17, mandatory: false, downloadUrl: "https://YOUR-EMS-SITE/api/app-store/download/com.ems.connectx", apk_size_bytes: 8645200, releaseNotes: "..." }` |
-| `GET` | `/api/app-store/download/:id` | Downloads signed APK binary. | Returns APK file binary with `application/vnd.android.package-archive` MIME. |
+## 7. Message types & smart formatting
 
-### 10.2 Device Token Routes (Used by Gateway)
-Header: `Authorization: Bearer <deviceToken>`
-
-| Method | Endpoint | Description | Payload / Response |
-| :--- | :--- | :--- | :--- |
-| `POST` | `/api/connectx/gateway/heartbeat` | Updates `last_seen` timestamp. | Responds with `{ ok: true, device, shop, administrator, smsEnabled }` |
-| `POST` | `/api/connectx/gateway/claim` | Claims up to `limit` queued SMS jobs. | Payload: `{"limit": 8}`<br>Responds: `{"jobs": [...]}` |
-| `POST` | `/api/connectx/gateway/report` | Reports dispatch success/failure. | Payload: `{"jobId": "...", "status": "sent" \| "failed", "error": null}` |
-| `POST` | `/api/connectx/gateway/cancel` | Atomically cancels **only queued** SMS jobs; already claimed jobs return 409. | Payload: `{"jobId": "..."}`<br>Responds: `{"ok": true, "cancelled": true}` |
-| `GET` | `/api/connectx/gateway/stats?utcOffsetMinutes=360` | Fetches SMS counters for the phone-local day. | Responds: `{"sent": 12, "failed": 0, "pending": 1, "administrator": {...}}` |
-| `GET` | `/api/connectx/gateway/activity?range=today&utcOffsetMinutes=360` | Fetches shop SMS activity for the phone-local day (or 7d/30d). | Responds: `{"items": [...]}` |
-| `GET` | `/api/connectx/gateway/me` | Fetches full pairing & admin profile. | Responds: `{"device": {...}, "shop": {...}, "administrator": {...}}` |
-| `PATCH`| `/api/connectx/gateway/sim` | Updates SIM slot, carrier, and phone. | Payload: `{"simSubscriptionId": 1, "simCarrier": "Grameenphone", "phoneNumber": "..."}` |
-| `POST` | `/api/connectx/gateway/test` | Triggers hardware self-test. | Payload: `{"ok": true, "record": false}` |
-| `POST` | `/api/connectx/gateway/disconnect` | Revokes device gateway token. | Responds: `{"ok": true}` |
-| `GET` | `/api/connectx/gateway/sim-carrier?mccMnc=...&carrierName=...` | Finds only the active carrier profile for an authenticated, non-revoked ConnectX device. | `{ supported: false }` or `{ supported: true, carrier: { carrier_name, balance_ussd_code, balance_pattern } }`. No USSD is sent by EMS. |
-
-### 10.3 Administrator Token Routes (Used during Login & Setup)
-Header: `Authorization: Bearer <adminToken>`
-
-| Method | Endpoint | Description | Payload / Response |
-| :--- | :--- | :--- | :--- |
-| `POST` | `/api/auth/admin/login` | Authenticates administrator. | Payload: `{"email": "...", "password": "..."}`<br>Responds: `{"token": "...", "user": {...}}` |
-| `GET` | `/api/connectx/gateway/shops` | Lists all shops for administrator. | Responds: `{"shops": [...], "administrator": {...}}` |
-| `POST` | `/api/connectx/gateway/register` | Pairs device & generates device token. | Payload: `{"storeId": "...", "deviceName": "...", "simSubscriptionId": 1, ...}` |
-| `GET` | `/api/admin/profile` | Fetches full administrator profile. | Responds: `{"id": "...", "admin_code": "1001", "name": "...", "phone": "...", "address": "..."}` |
+`formatMessageType()` in `Models.kt` maps raw `message_type`/`event_type` (and body
+heuristics) to display titles: Sales Invoice Confirmation, Due Invoice Reminder, Exchange/
+Return Invoice Confirmation, Payment Confirmation, Gateway Test Message, Custom Message —
+or any descriptive custom label a system sends.
 
 ---
 
-### 10.4 Read-only outgoing email API (new in v1.6)
+## 8. Building & deploying
 
-The **existing** EMS `connectx_messages` table records outgoing email. The email routes are authenticated with the paired-device token and scope every query to the device's `store_id`, additionally checking active pairing and administrator/shop status. Shop-hidden rows (`shop_deleted_at`) stay hidden. The phone is not granted provider credentials, incoming mail or send/delete permissions. No new database migration is needed for this feature.
+### 8.1 Android (this repo)
 
-| Method | Endpoint | Response |
-| :--- | :--- | :--- |
-| `GET` | `/api/connectx/gateway/emails/stats?utcOffsetMinutes=360` | Local-day sent/failed/pending counts plus latest **outgoing** email metadata; no body or BCC. |
-| `GET` | `/api/connectx/gateway/emails?page=0` | Up to 30 visible records plus `hasMore` and `snapshot`. Pass `page=1&snapshot=...` for older items; each list row contains recipients, subject, status, error and timestamps, **not** its body. |
-| `GET` | `/api/connectx/gateway/emails/:uuid` | One message in the paired shop, with body, To/CC/BCC and status for safe plain-text Android viewing. Other-shop/deleted messages return 404. |
+Prerequisites: Android Studio (JDK 17, Android SDK 35). Commands and signing rules:
+[BUILD_ANDROID.md](BUILD_ANDROID.md). Permissions: `SEND_SMS`, `READ_PHONE_STATE`,
+`READ_PHONE_NUMBERS`, `CALL_PHONE` (manual USSD only), foreground service (dataSync),
+notifications, boot-completed, `REQUEST_INSTALL_PACKAGES` (OTA), FileProvider
+(`${applicationId}.fileprovider`) for the installer.
 
-Phone offsets are signed integers in minutes east of UTC (`360` for Bangladesh Standard Time); missing offset defaults to UTC for older clients. Sent-today counts use `sent_at` when present, rather than when the job was queued. Pending means `queued` or `sending`. Email pagination uses a server-side snapshot anchor to avoid newly inserted records shifting older pages.
+### 8.2 ConnectX Control
 
----
+See `connectx-control/DEPLOY.md`: push the project to GitHub → Cloudflare Pages →
+create D1 `connectx-control` + R2 `connectx-releases` → put `SESSION_SECRET` →
+apply `schema/connectx_schema.sql` → open the site and create the owner account →
+configure systems → publish the APK under App Releases.
 
-## 11. Building & Deploying ConnectX
+### 8.3 Connecting a product (e.g. EMS)
 
-### 11.1 Prerequisites
-- **Android Studio Ladybug (2024.2.1+)** or IntelliJ IDEA
-- **JDK 17** (configured in Gradle JVM)
-- **Android SDK Platform 35** (Build Tools 35.0.0)
-
-### 11.2 Required Android Permissions & FileProvider
-In `AndroidManifest.xml`:
-```xml
-<uses-permission android:name="android.permission.INTERNET" />
-<uses-permission android:name="android.permission.SEND_SMS" />
-<uses-permission android:name="android.permission.READ_PHONE_STATE" />
-<uses-permission android:name="android.permission.READ_PHONE_NUMBERS" />
-<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-<uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
-<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-<uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-<uses-permission android:name="android.permission.WAKE_LOCK" />
-<uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
-<uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
-
-<provider
-    android:name="androidx.core.content.FileProvider"
-    android:authorities="${applicationId}.fileprovider"
-    android:exported="false"
-    android:grantUriPermissions="true">
-    <meta-data
-        android:name="android.support.FILE_PROVIDER_PATHS"
-        android:resource="@xml/file_paths" />
-</provider>
-```
-
-### 11.3 Gradle Build Commands
-```bash
-# Clean project
-./gradlew clean
-
-# Build Debug APK
-./gradlew assembleDebug
-
-# Build Release APK
-./gradlew assembleRelease
-```
-**`assembleRelease` without signing configuration creates `app-release-unsigned.apk`, which cannot update an installed app.** Use Android Studio **Generate Signed Bundle / APK → APK** with the installed app's original signing key, verify package `com.ems.connectx` and embedded **1.6.0/build 17**, then upload the signed file as documented in [`EMS/APP_STORE_RELEASE.md`](../EMS/APP_STORE_RELEASE.md). This source checkout may lack the `gradlew` launcher/wrapper JAR; Android Studio can generate it or use an installed Gradle distribution.
+No ConnectX-side code changes are needed. In ConnectX Control → **Systems & API Keys**:
+1. **Configure** the system: set its **API URL** (federated admin login + shop sync —
+   defaults match the EMS contract: `api/auth/admin/login`, `api/connectx/gateway/shops`)
+   and its **webhook URL** for delivery results.
+2. **Issue an API key** and put the ConnectX base URL + key into that product's
+   configuration; it calls `POST /api/client/v1/sms` with its `shop` reference.
+3. On a phone: pick the system, sign in with a system administrator account, choose a
+   shop, pair the SIM. Shops sync automatically.
 
 ---
 
-## 12. Maintenance & Support
+## 9. Maintenance & support
 
-ConnectX is actively maintained by **Dexter Studio**. For inquiries, custom gateway drivers, or EMS POS feature integrations, refer to the official repository at [https://github.com/sa8650/ConnectX](https://github.com/sa8650/ConnectX).
+- Rotate `SESSION_SECRET` only during a maintenance window (invalidates website/device
+  sessions; device tokens themselves survive — they are hashed independently).
+- Revoke lost/stolen phones immediately (Gateways → Revoke); the device token dies at once.
+- Keep the carrier catalog minimal and verified (SIM Carriers page) — USSD codes are
+  owner-managed by design; the APK contains none.
+- Database: single D1 `connectx-control`; audit trail in `cx_activity_log`; nightly D1
+  backups recommended once in production (`wrangler d1 export`).
+
+Built and maintained by **Dexter Studio**.

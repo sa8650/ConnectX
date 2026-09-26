@@ -1,4 +1,4 @@
-package com.ems.connectx.data
+package com.connectx.gateway.data
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
