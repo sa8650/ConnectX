@@ -1,4 +1,4 @@
-package com.ems.connectx.data
+package com.connectx.gateway.data
 
 import android.content.Context
 import android.content.SharedPreferences
@@ -27,7 +27,7 @@ class Prefs(context: Context) {
         set(v) {
             // Keep blank for a cleared/unconfigured session; never persist a
             // malformed "https:/" address that would later resolve host https.
-            store.edit().putString("baseUrl", if (v.isBlank()) "" else EmsSiteUrl.normalize(v)).apply()
+            store.edit().putString("baseUrl", if (v.isBlank()) "" else GatewayUrl.normalize(v)).apply()
         }
 
     var lastNotifiedUpdateCode: Int
@@ -192,7 +192,7 @@ class Prefs(context: Context) {
     fun clearSession() {
         // Old builds may have saved an incomplete address. Do not let an
         // invalid legacy URL prevent logout or reappear on the next login.
-        val url = runCatching { EmsSiteUrl.normalize(baseUrl) }.getOrNull().orEmpty()
+        val url = runCatching { GatewayUrl.normalize(baseUrl) }.getOrNull().orEmpty()
         store.edit().clear().apply()
         baseUrl = url
         seenGetStarted = true

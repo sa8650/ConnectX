@@ -1,4 +1,4 @@
-package com.ems.connectx.data
+package com.connectx.gateway.data
 
 import android.Manifest
 import android.app.Notification
@@ -10,10 +10,10 @@ import android.content.pm.PackageManager
 import android.os.Build
 import androidx.work.Worker
 import androidx.work.WorkerParameters
-import com.ems.connectx.BuildConfig
-import com.ems.connectx.ConnectXApp
-import com.ems.connectx.MainActivity
-import com.ems.connectx.R
+import com.connectx.gateway.BuildConfig
+import com.connectx.gateway.ConnectXApp
+import com.connectx.gateway.MainActivity
+import com.connectx.gateway.R
 import java.io.IOException
 
 /** Periodic best-effort check when ConnectX is in the background. The UI checks
@@ -46,7 +46,7 @@ class UpdateCheckWorker(context: Context, params: WorkerParameters) : Worker(con
         val notification = Notification.Builder(applicationContext, ConnectXApp.CHANNEL_UPDATES)
             .setSmallIcon(R.drawable.ic_stat_sms)
             .setContentTitle("ConnectX update available")
-            .setContentText("v${latest.latestVersion} (Build ${latest.versionCode}) is ready in EMS App Store.")
+            .setContentText("v${latest.latestVersion} (Build ${latest.versionCode}) is ready in ConnectX Releases.")
             .setContentIntent(open)
             .setAutoCancel(true)
             .build()

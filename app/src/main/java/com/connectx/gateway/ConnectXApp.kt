@@ -1,4 +1,4 @@
-package com.ems.connectx
+package com.connectx.gateway
 
 import android.app.Application
 import android.app.NotificationChannel
@@ -8,8 +8,8 @@ import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.NetworkType
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
-import com.ems.connectx.sms.QueueWorker
-import com.ems.connectx.data.UpdateCheckWorker
+import com.connectx.gateway.sms.QueueWorker
+import com.connectx.gateway.data.UpdateCheckWorker
 import java.util.concurrent.TimeUnit
 
 class ConnectXApp : Application() {

@@ -1,4 +1,4 @@
-package com.ems.connectx.data
+package com.connectx.gateway.data
 
 data class Shop(
     val id: String,
@@ -63,8 +63,9 @@ data class ActivityItem(
     val invoiceId: String? = null
 )
 
-// Email is already sent by EMS; the Android device reads this shop's outgoing
-// history only. No mailbox credentials or email-sending permission live here.
+// Email is sent by the client apps (EMS, CareOS, ...); the Android device reads
+// this workspace's outgoing history from ConnectX only. No mailbox credentials
+// or email-sending permission live here.
 data class EmailItem(
     val id: String,
     val subject: String,

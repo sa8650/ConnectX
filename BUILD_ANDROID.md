@@ -1,101 +1,95 @@
-# Build ConnectX in Android Studio
+# Building the ConnectX Android Gateway (v2.0.0 / build 18)
 
-The Android source was compiled with Gradle/Android SDK in this workspace and its local unit tests ran, but **no release-signed APK was built, installed or published here**. Build/sign on your computer with Android Studio and the original app signing key.
+## 1. What this app is
 
-ConnectX: Central Communication Gateway powered by Dexter Studio is a **native Kotlin + Jetpack Compose** app. SMS is delivered with Android `SmsManager` on the selected SIM; outgoing EMS email history is read-only over HTTPS for the paired shop. There is **no WebView or email provider login**. The APK contains no Supabase service-role key or privileged EMS/Brevo secret. After administrator sign-in, the phone stores a **revocable, shop-scoped device token**; existing administrator credentials may be retained for shop management, but not the password.
+ConnectX: Central Communication Gateway powered by Dexter Studio is a **native Kotlin +
+Jetpack Compose** app. SMS is delivered with Android `SmsManager` on the selected SIM;
+outgoing email history (pushed into ConnectX by client apps) is read-only over HTTPS for
+the paired workspace. There is **no WebView and no email provider login**. The APK contains
+no database key, no email-provider secret and no hard-coded USSD codes. After sign-in (or
+pairing-code entry), the phone stores a **revocable, workspace-scoped device token**; the
+operator password is never persisted.
 
-## 1. Install Android Studio
+The app talks **only** to your deployed **ConnectX Control** website (`connectx-control/`
+project). It has no EMS dependency of any kind.
 
-1. Download Android Studio from https://developer.android.com/studio
-2. Install it and open it once so the **Android SDK** is installed.
-3. In SDK Manager, install:
-   - Android SDK Platform **35**
-   - Android SDK Build-Tools
-   - Android SDK Platform-Tools
+## 2. Prerequisites
 
-## 2. Open this project
+- Android Studio (latest stable) with **JDK 17** and **Android SDK 35**
+- A deployed ConnectX Control website (Cloudflare Pages + D1 + R2 — see its `DEPLOY.md`)
+- Your Android release keystore
 
-1. Copy the `ConnectX` folder to your computer (the folder that contains `settings.gradle.kts` and `app/`).
-2. Android Studio → **File → Open** → select that `ConnectX` folder.
-3. When prompted **“Gradle wrapper not found / Trust project”**, choose **Trust**.
-4. Let Android Studio generate the Gradle wrapper if it asks (or use **File → New → New Module** is not needed — this is already an app module).
-5. If the IDE says the Gradle wrapper JAR is missing:
-   - **File → Settings → Build, Execution, Deployment → Gradle**
-   - Or from a terminal in the project folder, if you have Gradle installed: `gradle wrapper --gradle-version 9.3.1`
-   - Android Studio Ladybug / Koala will usually offer **Create Gradle wrapper**.
+## 3. Build steps
 
-6. Create `local.properties` if it is not generated automatically:
+1. Open this directory in Android Studio; let Gradle sync.
+2. Debug build: **Build → Build Bundle(s)/APK(s) → Build APK(s)**, or:
+   ```bash
+   ./gradlew assembleDebug
+   ```
+3. Release build: **Build → Generate Signed Bundle / APK → APK** → choose your keystore/key
+   alias → `release`. The source declares **v2.0.0 / build 18**, package
+   **`com.connectx.gateway`**, in `app/build.gradle.kts`; the About screen reads these
+   values from Gradle. Use Android Studio's **Locate** link for the signed output, not
+   `app-release-unsigned.apk` (renaming an unsigned APK does not sign it).
+4. Unit tests / lint:
+   ```bash
+   ./gradlew test lint
+   ```
 
-```
-sdk.dir=C:\\Users\\YOU\\AppData\\Local\\Android\\Sdk
-```
+> **Package rename note:** v2.0.0 changes the application id from the legacy
+> `com.ems.connectx` to `com.connectx.gateway`. Phones running the old EMS-linked build
+> must **uninstall it and install the new APK** — Android cannot update across package ids.
+> After that, all future updates flow through ConnectX Releases (OTA in-app).
 
-On macOS / Linux:
+## 4. First-run configuration on the phone
 
-```
-sdk.dir=/Users/YOU/Library/Android/sdk
-```
+1. **ConnectX Control URL** — copy the exact working address of your deployed ConnectX
+   Control website from the phone browser (Cloudflare Pages production URL or your custom
+   domain), e.g. shape `https://your-real-project.pages.dev`. Use the full `https://` +
+   domain origin, not `https:/`, not a GitHub repository link, not an APK URL. A copied
+   `/api` suffix, query string or fragment is removed by the validator.
+2. **Sign in** with a ConnectX Control account (created on the website under Settings →
+   Platform accounts), **or** use **Pair with code** using a pairing code generated in
+   ConnectX Control → Gateways.
+3. Pick the **workspace** this phone serves, grant SMS/telephony permissions, select the
+   **sending SIM**, then run the **test SMS** (or skip and test later from Settings).
 
-## 3. Sync and build
+Dashboard shows SMS and email sent/pending/failed counts and switches the active
+workspace. SMS has sending-SIM switch, manual balance and outgoing SMS details. Email has
+read-only, paginated outgoing history for the selected workspace. Settings has Log out,
+administrator profile and Send a Test SMS. Password recovery happens on the ConnectX
+Control website (owner resets it under Settings → Platform accounts).
 
-1. **File → Sync Project with Gradle Files**
-2. Wait until the status bar shows Gradle sync succeeded.
-3. Connect a phone with **USB debugging**, or start an emulator that has a SIM / SMS capability (a **physical phone with a SIM is required** for real SMS).
-4. Select the `app` run configuration.
-5. Click **Run** (green triangle) or **Build → Build Bundle(s) / APK(s) → Build APK(s)**.
-6. The debug APK will be at:
+**SIM Balance:** the SMS page shows the selected sending SIM's carrier and a masked number.
+**Refresh** fetches one matching, active balance dial code from the ConnectX Control
+carrier catalog (SIM Carriers page), requests `CALL_PHONE` when needed, and sends one USSD
+query to that SIM. No request is made automatically or through the wrong/default SIM.
+Until the owner configures a verified code and the carrier supplies a parseable reply, the
+card displays **“Balance unavailable.”** No dial codes are built into the APK.
 
-```
-app/build/outputs/apk/debug/app-debug.apk
-```
+**Updates:** after the URL is saved (and on sign-in, resume, hourly while open, ~6-hourly
+in background via WorkManager), the app checks the **public ConnectX release endpoint** —
+`GET /api/public/releases/check?package=com.connectx.gateway&versionCode=18` — on your
+Control website. A newer published build triggers a notification where permitted; the
+About & Updates screen has a manual **Check for Updates** button and shows a real error,
+never a false “up to date”. Downloads are verified for size, ZIP header, package name and
+advertised build code before Android's installer checks the signing certificate. Publish
+APKs in ConnectX Control → **App Releases** (R2 upload or vetted external HTTPS URL).
 
-For a release APK: **Build → Generate Signed Bundle / APK** → **APK** → choose the **same keystore/key alias that signed the app currently installed on this phone (build 15 or 16)** → `release` → generate a signed APK. If Build is hidden in Android Studio, open the **☰ main menu** or use **Ctrl+Shift+A / Cmd+Shift+A**, then search **Generate Signed**. The revised source declares **v1.6.0 / build 17**, package `com.ems.connectx`, in `app/build.gradle.kts`; the About screen reads these values from Gradle. Use the signed output located by Android Studio's **Locate** link, not `app-release-unsigned.apk`. Renaming an unsigned APK does not sign it. Verify its embedded package/build and signing certificate against the installed app before publication; a different key cannot update it. A phone already on build 17 needs a still-higher build code. Never publish metadata that disagrees with the actual binary. No build-17 signed APK was created in this workspace.
+## 5. Server side (required before the app can sign in)
 
-## 4. First run on the phone
+Deploy the `connectx-control/` project first — its `DEPLOY.md` covers D1/R2 creation,
+`SESSION_SECRET`, schema application and first-run owner setup. No EMS deployment,
+migration or configuration is involved anywhere in this flow.
 
-1. Open ConnectX.
-2. **Get started**
-3. Enter:
-   - **EMS website URL** — copy the exact working address of **your deployed EMS site** from the phone browser (Cloudflare Pages production URL or your custom domain). Example shape: `https://your-real-project.pages.dev`; this is **not** your actual hostname. Use its full `https://` + domain origin, not just `https:/`, `https://`, a GitHub repository, or an APK URL. A copied `/?page=app-store` or `/api` suffix will be removed by the new validator.
-   - **Administrator email**
-   - **Password**
-4. Do **not** enter a Shop ID.
-5. Select one or more shops.
-6. Allow **SMS** (and phone / notifications) permission.
-7. Choose the SIM that should send customer SMS.
-8. Send a **test SMS**, or tap **Skip for now** and send it later from Settings.
-9. **Dashboard** shows SMS and email sent/pending/failed counts and switches the active shop. **SMS** has sending-SIM switch, manual balance, and outgoing SMS details. **Email** has read-only, paginated outgoing EMS history and full details for the selected shop. Settings has **Log out**, administrator profile and **Send a Test SMS**.
-10. Keep the app installed. Optional but recommended: allow **unrestricted battery** so queued SMS still send when the screen is off.
+## 6. Troubleshooting
 
-Forgot password uses the same EMS administrator recovery flow as the website.
-
-**SIM Balance:** The SMS page shows the selected sending SIM's carrier and a masked number. **Refresh** fetches one matching, active balance dial code from EMS, requests `CALL_PHONE` permission when needed, and sends one USSD query to that SIM. No request is made automatically or through the wrong/default SIM. Until the owner configures a verified code and Android/the carrier supplies a parseable value, the card displays **“Balance unavailable.”** SMS quota has been removed. Administrator Profile and test SMS remain in **Settings**. See `EMS/SIM_BALANCE_SETUP.md` for schema upgrade and setup.
-
-**Updates:** After entering the EMS URL and signing in, ConnectX checks the public EMS App Store on launch, after login, on resume, and every hour while open. WorkManager checks approximately every six hours in the background (subject to Android scheduling/network/notification permission); a new build triggers a notification where permitted. The About & Updates screen has a manual **Check for Updates** button and shows a real error, not “up to date,” when no signed APK has been published or the server cannot be reached. Update downloads are checked for size, ZIP header, ConnectX package name, and advertised build code before Android's installer checks the signing certificate. The public EMS endpoint does not require an administrator token. Older builds cannot acquire the revised URL validation/background worker until updated. First correct the saved URL even on the old build; when the public EMS API and a real *higher-build* signed APK are published, supported builds can check for it via their existing update screen. See `EMS/APP_STORE_RELEASE.md` for the owner upload and verification steps.
-
-## 5. EMS server (required before the app can log in)
-
-On the EMS deployment:
-
-1. Apply SQL migration `EMS/supabase/migrations/041_connectx_sms_gateway.sql` (Supabase) **or** `EMS/supabase/d1/migration_connectx_gateway.sql` (Cloudflare D1).
-2. Deploy the updated EMS API (`functions/_lib/connectx_sms.js`, `functions/api/[[path]].js` plus App Store functions) and `assets/js/app.js`. Android build 17 needs the new **device email read** routes before its Email page works. Existing `connectx_messages` already stores outgoing EMS email; there is **no v1.6 email database migration**. Apply the App Store schema/migration and configure R2 as described in `EMS/APP_STORE_RELEASE.md`.
-3. If your deployed EMS already had the two-code carrier catalog, **back up** its database and run Supabase migration **044** or the existing-D1 `supabase/d1/migration_connectx_balance_only.sql` **once**. Fresh D1 `schema.sql` is balance-only; new Supabase installs run 043 then 044. Quota values are deleted, but balance codes and carrier rows remain. Sign in as **EMS platform owner → SIM balance** and keep only verified active balance codes. See `EMS/SIM_BALANCE_SETUP.md`. No dial codes are built into the APK.
-4. In the shop: **Settings → Communication** to enable SMS, templates, and device revoke.
-
-Sales, payments, returns, and exchanges still **complete if the phone is offline**. Those SMS jobs stay **pending** until this device claims them.
-
-## Troubleshooting
-
-| Problem | What to do |
+| Symptom | Fix |
 |---|---|
-| “Unable to resolve host https” / login and updates fail | `https:/` is missing the domain. Copy your **full production EMS URL** from a browser, e.g. `https://your-real-project.pages.dev`, into **EMS Website URL**. Log out and correct it if already saved. Build 17 rejects incomplete URLs before requesting the network. |
-| “Please sign in” / 401 | Confirm the EMS URL is the public site origin and deploy EMS's public app-store routes; administrative endpoints still require sign-in. |
-| “APK not available” / 503 | The EMS owner must upload a real signed APK to R2; the old GitHub v1.4.0 link returns 404. |
-| “Balance unavailable” | Check the selected SIM's MCC/MNC, EMS owner → SIM balance catalog (active + one verified code), connectivity, and CALL_PHONE permission. Carrier/network failures or unparseable replies also show unavailable; see `EMS/SIM_BALANCE_SETUP.md`. |
-| Email history unavailable | Deploy the new EMS API first. Confirm the selected shop, active device pairing and administrator/shop status; these endpoints require the shop-scoped device token. No inbound mailbox is provided. |
-| Update won't install | Check the APK's `com.ems.connectx` package, build code and signing certificate against the installed app. |
-| “Wrong email or password” | Use **administrator** email, not staff User ID or Shop ID. |
-| Gradle / SDK errors | Install SDK 35 and JDK 17 in Android Studio. |
-| SMS permission denied | Android Settings → Apps → ConnectX → Permissions → SMS. |
-| Messages stay pending | Open ConnectX, confirm gateway switch is on, disable battery optimisation, confirm the correct shop is selected. |
-| Duplicate SMS | Confirm the job and provider logs before retrying; conditional server claims prevent unclaimed jobs being dispatched, but a network/telephony timeout can still be ambiguous. Revoke unwanted devices in EMS Communication settings. |
+| “Unable to resolve host https” / login and updates fail | The saved URL is missing the domain. Copy the **full production ConnectX Control URL** from a browser into **ConnectX Control URL**. Log out and correct it if already saved. Build 18 rejects incomplete URLs before any network request. |
+| “Please sign in” / 401 | Confirm the URL is the public site origin; device routes need a valid `cxd_…` token — re-pair if it was revoked on the website. |
+| “APK not available” / 503 | The owner must upload a real signed APK in App Releases (or fix the external HTTPS URL). |
+| “Balance unavailable” | Check the SIM's MCC/MNC against the Control → SIM Carriers catalog (active + one verified code), connectivity, and CALL_PHONE permission. |
+| Email history unavailable | Confirm the selected workspace, an active device pairing, and that client apps actually push email records via `POST /api/client/v1/email`. |
+| Update won't install | Check the APK's `com.connectx.gateway` package, build code and signing certificate against the installed app; older `com.ems.connectx` installs must be replaced manually once. |
+| Duplicate SMS | Conditional server-side claims prevent double dispatch; a network/telephony timeout can still be ambiguous. Revoke unwanted devices in Control → Gateways. |

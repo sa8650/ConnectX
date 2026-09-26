@@ -7,3 +7,6 @@ local.properties
 .DS_Store
 captures/
 daemon/
+app/release/
+*.apk
+*.aab

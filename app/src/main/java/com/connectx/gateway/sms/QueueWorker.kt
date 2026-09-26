@@ -1,4 +1,4 @@
-package com.ems.connectx.sms
+package com.connectx.gateway.sms
 
 import android.content.Context
 import androidx.work.Worker

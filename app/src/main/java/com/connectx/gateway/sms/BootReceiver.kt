@@ -1,9 +1,9 @@
-package com.ems.connectx.sms
+package com.connectx.gateway.sms
 
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import com.ems.connectx.data.Prefs
+import com.connectx.gateway.data.Prefs
 
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {

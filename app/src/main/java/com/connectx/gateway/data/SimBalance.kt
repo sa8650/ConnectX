@@ -1,9 +1,9 @@
-package com.ems.connectx.data
+package com.connectx.gateway.data
 
 import java.math.BigDecimal
 import java.math.RoundingMode
 
-/** Received from the owner-managed EMS catalog. The APK contains no carrier dial code. */
+/** Received from the owner-managed ConnectX Control catalog. The APK contains no carrier dial code. */
 data class CarrierBalanceConfig(
     val name: String,
     val balanceCode: String,
@@ -20,7 +20,7 @@ data class CarrierBalanceConfig(
 
 /** Fail closed: an unlabeled or ambiguous number is not a SIM balance.
  * An optional owner pattern must capture the *entire* numeric amount in group 1.
- * No raw reply is sent to EMS. */
+ * No raw reply is sent to the server. */
 object BalanceReplyParser {
     private const val amount = "([\\p{Nd}]+(?:[.,][\\p{Nd}]+)*)"
     private val defaults = listOf(

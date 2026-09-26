@@ -1,4 +1,4 @@
-package com.ems.connectx.ui
+package com.connectx.gateway.ui
 
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
@@ -48,7 +48,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.ems.connectx.R
+import com.connectx.gateway.R
 
 // =========================================================================
 // MOBBIN-INSPIRED MODERN LIGHT THEME PALETTE

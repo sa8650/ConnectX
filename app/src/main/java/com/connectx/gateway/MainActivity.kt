@@ -1,4 +1,4 @@
-package com.ems.connectx
+package com.connectx.gateway
 
 import android.Manifest
 import android.content.Intent
@@ -43,12 +43,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
 import androidx.core.content.ContextCompat
-import com.ems.connectx.data.*
-import com.ems.connectx.sms.GatewayService
-import com.ems.connectx.sms.QueueProcessor
-import com.ems.connectx.sms.SmsSender
-import com.ems.connectx.sms.SimUssdClient
-import com.ems.connectx.ui.*
+import com.connectx.gateway.data.*
+import com.connectx.gateway.sms.GatewayService
+import com.connectx.gateway.sms.QueueProcessor
+import com.connectx.gateway.sms.SmsSender
+import com.connectx.gateway.sms.SimUssdClient
+import com.connectx.gateway.ui.*
 import java.io.File
 import java.io.FileOutputStream
 import java.util.Locale
@@ -98,6 +98,9 @@ class MainActivity : ComponentActivity() {
         var route by remember { mutableStateOf(initialRoute()) }
         var selectedShop by remember { mutableStateOf<Shop?>(null) }
         var selectedSim by remember { mutableStateOf<SubscriptionInfo?>(null) }
+        // Set when the user chose "Pair with a code" on the sign-in screen; the
+        // register step then calls device/pair instead of the account flow.
+        var pendingPairCode by remember { mutableStateOf<String?>(null) }
         var tab by remember { mutableIntStateOf(0) }
         var session by remember { mutableIntStateOf(0) }
         var updateInfo by remember { mutableStateOf<AppUpdateInfo?>(null) }
@@ -161,7 +164,7 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // Public App Store: check on launch, after EMS URL is saved, on resume,
+        // Public release check: on launch, after the gateway URL is saved, on resume,
         // and hourly while the UI is active. WorkManager checks in background.
         LaunchedEffect(route, session, resumeToken) {
             if (prefs.baseUrl.isBlank()) return@LaunchedEffect
@@ -175,7 +178,7 @@ class MainActivity : ComponentActivity() {
                     throw e
                 } catch (e: Exception) {
                     updateChecked = false
-                    updateCheckError = e.message ?: "Could not reach the EMS App Store."
+                    updateCheckError = e.message ?: "Could not reach the ConnectX release server."
                 }
                 delay(60 * 60 * 1000L)
             }
@@ -316,9 +319,9 @@ class MainActivity : ComponentActivity() {
 
                     Text(
                         when (wizardStatus) {
-                            "ready" -> "Download complete. Android will check the APK signature. If it says ‘App not installed,’ ask the EMS owner for an APK signed with the same key as your current app."
+                            "ready" -> "Download complete. Android will check the APK signature. If it says ‘App not installed,’ ask the ConnectX platform owner for an APK signed with the same key as your current app."
                             "error" -> wizardError.ifBlank { "Could not download APK. Please check your network connection." }
-                            else -> "Downloading v${wizardTargetUpdate?.latestVersion ?: APP_VERSION_NAME} (Build ${wizardTargetUpdate?.versionCode ?: APP_VERSION_CODE}) directly from EMS App Store…"
+                            else -> "Downloading v${wizardTargetUpdate?.latestVersion ?: APP_VERSION_NAME} (Build ${wizardTargetUpdate?.versionCode ?: APP_VERSION_CODE}) directly from ConnectX Releases…"
                         },
                         fontSize = 13.sp,
                         color = TextSecondary,
@@ -509,10 +512,17 @@ class MainActivity : ComponentActivity() {
                     route = "login"
                 }
             )
-            "login" -> LoginScreen {
-                prefs.signedIn = true
-                route = if (prefs.connections().any { it.setupComplete }) "home" else "shops"
-            }
+            "login" -> LoginScreen(
+                onOk = {
+                    prefs.signedIn = true
+                    route = if (prefs.connections().any { it.setupComplete }) "home" else "shops"
+                },
+                onPair = { code ->
+                    pendingPairCode = code
+                    prefs.signedIn = true
+                    route = "permission"
+                }
+            )
             "shops" -> ShopListScreen(
                 onBack = {
                     if (prefs.connections().any { it.setupComplete }) {
@@ -526,7 +536,7 @@ class MainActivity : ComponentActivity() {
             )
             "permission" -> PermissionScreen(
                 onContinue = { route = "sim" },
-                onBack = { route = "shops" }
+                onBack = { route = if (pendingPairCode != null) "login" else "shops" }
             )
             "sim" -> SimScreen(
                 onBack = { route = "permission" },
@@ -535,8 +545,15 @@ class MainActivity : ComponentActivity() {
                     route = "register"
                 }
             )
-            "register" -> RegisteringScreen(selectedShop, selectedSim) { ok ->
-                route = if (ok) "test" else "sim"
+            "register" -> RegisteringScreen(selectedShop, selectedSim, pendingPairCode) { ok ->
+                route = if (ok) {
+                    pendingPairCode = null
+                    "test"
+                } else if (pendingPairCode != null) {
+                    // Invalid/expired code: let the user enter a fresh one.
+                    pendingPairCode = null
+                    "login"
+                } else "sim"
             }
             "test" -> TestSmsScreen(selectedSim) {
                 tab = 0
@@ -561,7 +578,7 @@ class MainActivity : ComponentActivity() {
                             else toast("ConnectX is up to date (v$APP_VERSION_NAME)")
                         } catch (e: Exception) {
                             updateChecked = false
-                            updateCheckError = e.message ?: "Could not reach the EMS App Store."
+                            updateCheckError = e.message ?: "Could not reach the ConnectX release server."
                             toast("Update check failed: $updateCheckError")
                         } finally {
                             checkingUpdates = false
@@ -627,22 +644,22 @@ class MainActivity : ComponentActivity() {
             listOf(
                 OnboardingStep(
                     badge = "CENTRAL COMMUNICATION",
-                    title = "SMS dispatch and EMS email history",
-                    subtitle = "ConnectX: Central Communication Gateway powered by Dexter Studio. Send SMS from your SIM and review outgoing EMS emails for your selected shop.",
+                    title = "SMS dispatch and email history",
+                    subtitle = "ConnectX: Central Communication Gateway powered by Dexter Studio. Send SMS from your SIM and review outgoing email history for your selected workspace.",
                     icon = Icons.Outlined.Sensors,
                     features = listOf(
                         Icons.Outlined.Bolt to "Direct cellular SMS from your device's SIM",
-                        Icons.Outlined.Email to "Read-only EMS outgoing email history",
+                        Icons.Outlined.Email to "Read-only outgoing email history",
                         Icons.Outlined.Sync to "Background SMS queue while the screen is off"
                     )
                 ),
                 OnboardingStep(
                     badge = "MULTI-STORE ROUTING",
-                    title = "One phone, multiple shop branches",
-                    subtitle = "Switch shops for both SMS and email history. Choose each shop’s sending SIM for SMS only; EMS handles outgoing email independently.",
+                    title = "One phone, multiple workspaces",
+                    subtitle = "Switch workspaces for both SMS and email history. Choose each workspace’s sending SIM for SMS only; connected apps handle outgoing email independently.",
                     icon = Icons.Outlined.Store,
                     features = listOf(
-                        Icons.Outlined.SimCard to "Assign dedicated SIM carriers per shop location",
+                        Icons.Outlined.SimCard to "Assign dedicated SIM carriers per workspace",
                         Icons.Outlined.Layers to "Isolated message queues per retail branch",
                         Icons.Outlined.SwapHoriz to "Seamless SIM switching directly from the app"
                     )
@@ -661,12 +678,12 @@ class MainActivity : ComponentActivity() {
                 OnboardingStep(
                     badge = "ENTERPRISE PRIVACY",
                     title = "Zero passwords stored on device",
-                    subtitle = "Secure cryptographic device token pairing. Manage and revoke hardware access anytime directly from your EMS console.",
+                    subtitle = "Secure cryptographic device token pairing. Manage and revoke hardware access anytime directly from the ConnectX Control website.",
                     icon = Icons.Outlined.Security,
                     features = listOf(
                         Icons.Outlined.Lock to "Encrypted token storage via Android KeyStore",
                         Icons.Outlined.CloudOff to "Queued messages wait safely if phone goes offline",
-                        Icons.Outlined.PowerSettingsNew to "One-tap remote device token revocation from EMS"
+                        Icons.Outlined.PowerSettingsNew to "One-tap remote device token revocation from ConnectX Control"
                     )
                 )
             )
@@ -884,11 +901,13 @@ class MainActivity : ComponentActivity() {
      * SIGN IN SCREEN (Light Theme)
      * ===================================================================== */
     @Composable
-    private fun LoginScreen(onOk: () -> Unit) {
+    private fun LoginScreen(onOk: () -> Unit, onPair: (String) -> Unit) {
         var url by remember { mutableStateOf(prefs.baseUrl) }
         var urlError by remember { mutableStateOf<String?>(null) }
         var email by remember { mutableStateOf(prefs.adminEmail) }
         var password by remember { mutableStateOf("") }
+        var pairMode by remember { mutableStateOf(false) }
+        var pairCode by remember { mutableStateOf("") }
         var loading by remember { mutableStateOf(false) }
         val scope = rememberCoroutineScope()
         val already = prefs.connections()
@@ -906,10 +925,11 @@ class MainActivity : ComponentActivity() {
             Spacer(Modifier.height(10.dp))
             BrandMark(56.dp)
             Spacer(Modifier.height(18.dp))
-            Text("Sign in", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
+            Text(if (pairMode) "Pair this phone" else "Sign in", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
             Spacer(Modifier.height(6.dp))
             Text(
-                "Sign in with your EMS administrator account. Your password is used only for device registration and is never stored on this phone.",
+                if (pairMode) "Enter a pairing code generated in ConnectX Control → Gateways. No account is needed on this phone."
+                else "Sign in with your ConnectX Control account. Your password is used only for device registration and is never stored on this phone.",
                 color = TextSecondary,
                 fontSize = 13.sp,
                 lineHeight = 19.sp
@@ -930,7 +950,7 @@ class MainActivity : ComponentActivity() {
                         Icon(Icons.Outlined.CheckCircle, null, tint = AccentEmerald, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(8.dp))
                         Text(
-                            "${already.size} shop${if (already.size == 1) "" else "s"} already connected on this device",
+                            "${already.size} workspace${if (already.size == 1) "" else "s"} already connected on this device",
                             color = TextPrimary,
                             fontSize = 12.sp,
                             fontWeight = FontWeight.Medium
@@ -951,9 +971,9 @@ class MainActivity : ComponentActivity() {
                     OutlinedTextField(
                         value = url,
                         onValueChange = { url = it; urlError = null },
-                        label = { Text("EMS Website URL") },
-                        placeholder = { Text("https://your-ems.pages.dev") },
-                        supportingText = { Text(urlError ?: "Use the complete deployed EMS domain, not just https:/ or GitHub.",
+                        label = { Text("ConnectX Control URL") },
+                        placeholder = { Text("https://connectx-control.pages.dev") },
+                        supportingText = { Text(urlError ?: "Use the complete deployed ConnectX Control domain, not just https:/ or GitHub.",
                             color = if (urlError != null) RoseText else TextMuted, fontSize = 11.sp) },
                         isError = urlError != null,
                         leadingIcon = { Icon(Icons.Outlined.Language, null, tint = PrimaryBlue) },
@@ -963,46 +983,70 @@ class MainActivity : ComponentActivity() {
                         colors = fields
                     )
                     Spacer(Modifier.height(12.dp))
-                    OutlinedTextField(
-                        value = email,
-                        onValueChange = { email = it },
-                        label = { Text("Administrator Email") },
-                        placeholder = { Text("admin@example.com") },
-                        leadingIcon = { Icon(Icons.Outlined.Email, null, tint = PrimaryBlue) },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true,
-                        shape = RoundedCornerShape(12.dp),
-                        colors = fields
-                    )
-                    Spacer(Modifier.height(12.dp))
-                    OutlinedTextField(
-                        value = password,
-                        onValueChange = { password = it },
-                        label = { Text("Password") },
-                        leadingIcon = { Icon(Icons.Outlined.Lock, null, tint = PrimaryBlue) },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true,
-                        visualTransformation = PasswordVisualTransformation(),
-                        shape = RoundedCornerShape(12.dp),
-                        colors = fields
-                    )
+                    if (pairMode) {
+                        OutlinedTextField(
+                            value = pairCode,
+                            onValueChange = { input ->
+                                pairCode = input.uppercase()
+                                    .filter { it.isLetterOrDigit() || it == '-' }
+                                    .take(9)
+                            },
+                            label = { Text("Pairing code") },
+                            placeholder = { Text("4F7K-9Q2M") },
+                            supportingText = { Text("Codes are single-use and expire; generate one in ConnectX Control → Gateways.",
+                                color = TextMuted, fontSize = 11.sp) },
+                            leadingIcon = { Icon(Icons.Outlined.Key, null, tint = PrimaryBlue) },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true,
+                            shape = RoundedCornerShape(12.dp),
+                            colors = fields
+                        )
+                    } else {
+                        OutlinedTextField(
+                            value = email,
+                            onValueChange = { email = it },
+                            label = { Text("Administrator Email") },
+                            placeholder = { Text("admin@example.com") },
+                            leadingIcon = { Icon(Icons.Outlined.Email, null, tint = PrimaryBlue) },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true,
+                            shape = RoundedCornerShape(12.dp),
+                            colors = fields
+                        )
+                        Spacer(Modifier.height(12.dp))
+                        OutlinedTextField(
+                            value = password,
+                            onValueChange = { password = it },
+                            label = { Text("Password") },
+                            leadingIcon = { Icon(Icons.Outlined.Lock, null, tint = PrimaryBlue) },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true,
+                            visualTransformation = PasswordVisualTransformation(),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = fields
+                        )
+                    }
                 }
             }
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.End
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
+                // No self-service reset exists on the control website — point
+                // users at the owner instead of a dead link.
+                Text(
+                    if (pairMode) "Codes are single-use and expire shortly."
+                    else "Forgot password? Ask your platform owner.",
+                    fontSize = 12.sp,
+                    color = TextSecondary
+                )
                 TextButton(
-                    onClick = {
-                        val checked = runCatching { EmsSiteUrl.normalize(url) }
-                        val u = checked.getOrNull()
-                        if (u == null) urlError = checked.exceptionOrNull()?.message ?: EmsSiteUrl.HELP
-                        if (u != null) startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("$u/#forgot")))
-                    },
+                    onClick = { pairMode = !pairMode },
                     colors = ButtonDefaults.textButtonColors(contentColor = PrimaryBlue)
                 ) {
-                    Text("Forgot password?", fontSize = 13.sp)
+                    Text(if (pairMode) "Sign in with account" else "Pair with a code instead", fontSize = 13.sp)
                 }
             }
 
@@ -1010,10 +1054,18 @@ class MainActivity : ComponentActivity() {
 
             Button(
                 onClick = {
-                    val checked = runCatching { EmsSiteUrl.normalize(url) }
+                    val checked = runCatching { GatewayUrl.normalize(url) }
                     val site = checked.getOrNull()
-                    if (site == null) urlError = checked.exceptionOrNull()?.message ?: EmsSiteUrl.HELP
-                    if (site != null) scope.launch {
+                    if (site == null) urlError = checked.exceptionOrNull()?.message ?: GatewayUrl.HELP
+                    if (site != null && pairMode) {
+                        val code = pairCode.trim().uppercase()
+                        if (!Regex("^[A-Z0-9]{4}-[A-Z0-9]{4}$").matches(code)) {
+                            toast("Enter the code exactly as shown, e.g. 4F7K-9Q2M.")
+                        } else {
+                            prefs.baseUrl = site
+                            onPair(code)
+                        }
+                    } else if (site != null) scope.launch {
                         loading = true
                         try {
                             prefs.baseUrl = site
@@ -1021,14 +1073,15 @@ class MainActivity : ComponentActivity() {
                             onOk()
                         } catch (e: Exception) {
                             if (e is UnknownHostException || e.cause is UnknownHostException)
-                                urlError = e.message ?: "EMS website not found. Check the full deployed domain."
+                                urlError = e.message ?: "ConnectX Control website not found. Check the full deployed domain."
                             toast(e.message ?: "Sign in failed")
                         } finally {
                             loading = false
                         }
                     }
                 },
-                enabled = !loading && url.isNotBlank() && email.isNotBlank() && password.isNotBlank(),
+                enabled = !loading && url.isNotBlank() &&
+                    (if (pairMode) pairCode.isNotBlank() else email.isNotBlank() && password.isNotBlank()),
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(52.dp),
@@ -1045,7 +1098,7 @@ class MainActivity : ComponentActivity() {
                     Spacer(Modifier.width(10.dp))
                     Text("Signing in…", fontSize = 15.sp)
                 } else {
-                    Text("Sign in", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                    Text(if (pairMode) "Continue with code" else "Sign in", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
                 }
             }
 
@@ -1087,9 +1140,9 @@ class MainActivity : ComponentActivity() {
                 .navigationBarsPadding()
                 .padding(20.dp)
         ) {
-            Text("Select a shop", fontSize = 26.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
+            Text("Select a workspace", fontSize = 26.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
             Text(
-                "One device can serve multiple shops. Each shop maintains its own isolated SMS queue.",
+                "One device can serve multiple workspaces. Each workspace maintains its own isolated message queue.",
                 color = TextSecondary,
                 fontSize = 13.sp,
                 modifier = Modifier.padding(top = 4.dp, bottom = 16.dp)
@@ -1134,7 +1187,7 @@ class MainActivity : ComponentActivity() {
                     ) {
                         Icon(Icons.Outlined.Storefront, null, tint = TextMuted, modifier = Modifier.size(40.dp))
                         Spacer(Modifier.height(10.dp))
-                        Text("No shops found for this administrator.", color = TextSecondary, fontSize = 14.sp)
+                        Text("No workspaces found for this account.", color = TextSecondary, fontSize = 14.sp)
                     }
                 }
             }
@@ -1238,7 +1291,7 @@ class MainActivity : ComponentActivity() {
                 Text("Allow SMS permission", fontSize = 26.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    "ConnectX requires SMS and telephony permissions so this phone can send customer messages from your local SIM card. EMS never controls your SIM card directly.",
+                    "ConnectX requires SMS and telephony permissions so this phone can send customer messages from your local SIM card. No remote software ever controls your SIM card directly.",
                     color = TextSecondary,
                     fontSize = 14.sp,
                     lineHeight = 20.sp
@@ -1325,7 +1378,7 @@ class MainActivity : ComponentActivity() {
         ) {
             Text("Choose sending SIM", fontSize = 26.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
             Text(
-                "Select which SIM card this shop should use to send SMS messages. You can switch SIMs anytime from Settings.",
+                "Select which SIM card this workspace should use to send SMS messages. You can switch SIMs anytime from Settings.",
                 color = TextSecondary,
                 fontSize = 13.sp,
                 modifier = Modifier.padding(top = 4.dp, bottom = 18.dp)
@@ -1395,24 +1448,36 @@ class MainActivity : ComponentActivity() {
      * REGISTERING SCREEN
      * ===================================================================== */
     @Composable
-    private fun RegisteringScreen(shop: Shop?, sim: SubscriptionInfo?, onDone: (Boolean) -> Unit) {
-        var msg by remember { mutableStateOf("Registering this device…") }
+    private fun RegisteringScreen(shop: Shop?, sim: SubscriptionInfo?, pairCode: String?, onDone: (Boolean) -> Unit) {
+        var msg by remember { mutableStateOf(if (pairCode != null) "Pairing this device…" else "Registering this device…") }
 
-        LaunchedEffect(shop, sim) {
-            if (shop == null || sim == null) {
+        LaunchedEffect(shop, sim, pairCode) {
+            if (sim == null || (shop == null && pairCode == null)) {
                 onDone(false)
                 return@LaunchedEffect
             }
             try {
                 withContext(Dispatchers.IO) {
-                    api.registerDevice(
-                        shopId = shop.id,
-                        deviceName = "${Build.MANUFACTURER} ${Build.MODEL}",
-                        androidVersion = Build.VERSION.RELEASE,
-                        simId = sim.subscriptionId,
-                        carrier = sim.carrierName?.toString().orEmpty(),
-                        phone = sim.number.orEmpty()
-                    )
+                    if (pairCode != null) {
+                        api.pairDevice(
+                            code = pairCode,
+                            deviceName = "${Build.MANUFACTURER} ${Build.MODEL}",
+                            androidVersion = Build.VERSION.RELEASE,
+                            appVersion = APP_VERSION_NAME,
+                            simId = sim.subscriptionId,
+                            carrier = sim.carrierName?.toString().orEmpty(),
+                            phone = sim.number.orEmpty()
+                        )
+                    } else {
+                        api.registerDevice(
+                            shopId = shop!!.id,
+                            deviceName = "${Build.MANUFACTURER} ${Build.MODEL}",
+                            androidVersion = Build.VERSION.RELEASE,
+                            simId = sim.subscriptionId,
+                            carrier = sim.carrierName?.toString().orEmpty(),
+                            phone = sim.number.orEmpty()
+                        )
+                    }
                 }
                 msg = "Device paired successfully."
                 delay(400)
@@ -1479,7 +1544,7 @@ class MainActivity : ComponentActivity() {
                 Text("Send a test SMS", fontSize = 26.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    "Confirm that this device can send customer SMS messages for ${conn?.shopName ?: "this shop"}. You can skip this step and test later.",
+                    "Confirm that this device can send customer SMS messages for ${conn?.shopName ?: "this workspace"}. You can skip this step and test later.",
                     color = TextSecondary,
                     fontSize = 13.sp,
                     lineHeight = 19.sp
@@ -1706,7 +1771,7 @@ class MainActivity : ComponentActivity() {
             launch {
                 try { emailStats = withContext(Dispatchers.IO) { api.emailStats(conn.shopId) } }
                 catch (e: CancellationException) { throw e }
-                catch (e: Exception) { emailError = e.message ?: "Email statistics unavailable. Update EMS." }
+                catch (e: Exception) { emailError = e.message ?: "Email statistics unavailable. Update ConnectX Control." }
                 finally { loadingEmail = false }
             }
         }
@@ -1808,7 +1873,7 @@ class MainActivity : ComponentActivity() {
                         ) {
                             Icon(Icons.Outlined.SwapHoriz, null, modifier = Modifier.size(16.dp))
                             Spacer(Modifier.width(4.dp))
-                            Text("Switch shop", fontSize = 12.sp)
+                            Text("Switch workspace", fontSize = 12.sp)
                         }
                     }
 
@@ -1816,7 +1881,7 @@ class MainActivity : ComponentActivity() {
                     Text(getString(R.string.brand_full), color = TextSecondary,
                         fontSize = 12.sp, lineHeight = 17.sp)
                     Spacer(Modifier.height(12.dp))
-                    Text("Active shop", color = TextMuted, fontSize = 11.sp)
+                    Text("Active workspace", color = TextMuted, fontSize = 11.sp)
 
                     Text(
                         text = stats.shopName.ifBlank { conn?.shopName ?: "ConnectX" },
@@ -1890,12 +1955,12 @@ class MainActivity : ComponentActivity() {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(Icons.Outlined.Email, null, tint = AccentPurple)
                     Spacer(Modifier.width(8.dp))
-                    Text("Email · EMS ConnectX", fontWeight = FontWeight.Bold, fontSize = 17.sp,
+                    Text("Email · ConnectX", fontWeight = FontWeight.Bold, fontSize = 17.sp,
                         color = TextPrimary)
                 }
                 TextButton(onClick = onOpenEmail) { Text("Open Email →") }
             }
-            Text("Outgoing history for this shop · read-only", color = TextSecondary,
+            Text("Outgoing history for this workspace · read-only", color = TextSecondary,
                 fontSize = 12.sp, modifier = Modifier.padding(bottom = 10.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 MetricCard("Sent today", if (loadingEmail || emailError != null) "—" else (emailStats?.sent?.toString() ?: "—"),
@@ -1906,7 +1971,7 @@ class MainActivity : ComponentActivity() {
                     AccentRose, Modifier.weight(1f))
             }
             if (emailError != null) {
-                Text("Email: $emailError · Check connection and deploy the matching EMS API.",
+                Text("Email: $emailError · Check connection and update the ConnectX Control deployment.",
                     color = RoseText, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
             } else if (emailStats?.latest != null) {
                 val latest = emailStats!!.latest!!
@@ -1927,7 +1992,7 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             } else if (!loadingEmail) {
-                Text("No outgoing email history for this shop.", color = TextMuted,
+                Text("No outgoing email history for this workspace.", color = TextMuted,
                     fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
             }
 
@@ -2179,7 +2244,7 @@ class MainActivity : ComponentActivity() {
             ) {
                 Column {
                     Text("SMS", fontSize = 26.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
-                    Text("${conn?.shopName ?: "No paired shop"} · SIM dispatch and history",
+                    Text("${conn?.shopName ?: "No paired workspace"} · SIM dispatch and history",
                         color = TextSecondary, fontSize = 12.sp)
                 }
 
@@ -2563,7 +2628,7 @@ class MainActivity : ComponentActivity() {
     }
 
     /* =====================================================================
-     * EMAIL TAB — read-only, paginated EMS outgoing history for active shop
+     * EMAIL TAB — read-only, paginated ConnectX outgoing history for the active workspace
      * ===================================================================== */
     @Composable
     private fun EmailTab(conn: Connection?) {
@@ -2602,7 +2667,7 @@ class MainActivity : ComponentActivity() {
                 snapshot = result.snapshot
             } catch (e: CancellationException) { throw e }
             catch (e: Exception) {
-                error = e.message ?: "Could not load email history. Check EMS and retry."
+                error = e.message ?: "Could not load email history. Check ConnectX Control and retry."
             } finally { loading = false }
         }
 
@@ -2631,7 +2696,7 @@ class MainActivity : ComponentActivity() {
                     Column(Modifier.weight(1f)) {
                         Text("Email", fontWeight = FontWeight.Bold, fontSize = 26.sp,
                             color = TextPrimary)
-                        Text(conn?.shopName ?: "No paired shop", fontSize = 12.sp,
+                        Text(conn?.shopName ?: "No paired workspace", fontSize = 12.sp,
                             color = TextSecondary)
                     }
                     IconButton(onClick = { scope.launch { load(reset = true) } },
@@ -2648,7 +2713,7 @@ class MainActivity : ComponentActivity() {
                     Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Outlined.MarkEmailRead, null, tint = PrimaryBlue)
                         Spacer(Modifier.width(10.dp))
-                        Text("EMS ConnectX outgoing email history for this shop. View sent, failed and pending messages here; send new email from EMS.",
+                        Text("ConnectX outgoing email history for this workspace. View sent, failed and pending messages here; email is sent by your connected apps.",
                             color = TextPrimary, fontSize = 12.sp, lineHeight = 18.sp)
                     }
                 }
@@ -2691,7 +2756,7 @@ class MainActivity : ComponentActivity() {
                     AppCard(containerColor = AccentRoseBg, borderColor = AccentRoseBorder) {
                         Column(Modifier.fillMaxWidth().padding(16.dp)) {
                             Text("Email history unavailable: $error", color = RoseText, fontSize = 13.sp)
-                            Text("Check EMS connectivity; deploy the v1.6 device API if needed.",
+                            Text("Check ConnectX Control connectivity and retry.",
                                 color = TextSecondary, fontSize = 12.sp)
                             TextButton(onClick = { scope.launch { load(reset = emails.isEmpty()) } }) {
                                 Text("Try again")
@@ -2705,7 +2770,7 @@ class MainActivity : ComponentActivity() {
                             Icon(Icons.Outlined.Email, null, tint = TextMuted,
                                 modifier = Modifier.size(36.dp))
                             Spacer(Modifier.height(8.dp))
-                            Text("No outgoing emails for this shop yet.", color = TextSecondary)
+                            Text("No outgoing emails for this workspace yet.", color = TextSecondary)
                         }
                     }
                 } else if (hasMore) {
@@ -2774,7 +2839,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** Render EMS-generated HTML as inert text; never execute remote email HTML,
+    /** Render client-generated HTML as inert text; never execute remote email HTML,
      * JavaScript, or image URLs inside the Android app. */
     private fun readableEmailBody(mail: EmailItem): String {
         if (mail.bodyHtml.isBlank()) return mail.customBody.ifBlank { "No email body recorded." }
@@ -2947,7 +3012,7 @@ class MainActivity : ComponentActivity() {
                     )
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        conn?.shopName ?: "No shop connected",
+                        conn?.shopName ?: "No workspace connected",
                         color = TextPrimary,
                         fontWeight = FontWeight.Bold,
                         fontSize = 18.sp
@@ -2968,7 +3033,7 @@ class MainActivity : ComponentActivity() {
                         Column(Modifier.weight(1f)) {
                             Text("SMS Gateway Active", color = TextPrimary, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
                             Text(
-                                "When paused, customer SMS jobs stay queued safely in EMS.",
+                                "When paused, customer SMS jobs stay queued safely in ConnectX.",
                                 color = TextMuted,
                                 fontSize = 11.sp
                             )
@@ -3021,7 +3086,7 @@ class MainActivity : ComponentActivity() {
 
             SettingsRow(
                 icon = Icons.Outlined.Store,
-                title = "Connected Shops (${prefs.connections().size})",
+                title = "Connected Workspaces (${prefs.connections().size})",
                 sub = "Manage retail outlets paired with this device",
                 onClick = { onAddShop() }
             )
@@ -3040,15 +3105,15 @@ class MainActivity : ComponentActivity() {
 
             SettingsRow(
                 icon = Icons.Outlined.LinkOff,
-                title = "Disconnect this Shop",
-                sub = "Revoke device gateway authorization for ${conn?.shopName ?: "this shop"}",
+                title = "Disconnect this Workspace",
+                sub = "Revoke device gateway authorization for ${conn?.shopName ?: "this workspace"}",
                 accentColor = AccentRose,
                 onClick = {
                     scope.launch {
                         conn?.let {
                             withContext(Dispatchers.IO) { api.disconnect(it.shopId) }
                             if (prefs.connections().isEmpty()) GatewayService.stop(this@MainActivity)
-                            toast("Shop disconnected.")
+                            toast("Workspace disconnected.")
                             onSession()
                         }
                     }
@@ -3065,7 +3130,7 @@ class MainActivity : ComponentActivity() {
             Spacer(Modifier.height(14.dp))
 
             Text(
-                "ConnectX never retains your administrator password after pairing.\nRevoke gateway devices from EMS Settings → Communication anytime.\n\nPowered by Dexter Studio",
+                "ConnectX never retains your administrator password after pairing.\nRevoke gateway devices from ConnectX Control → Gateways anytime.\n\nPowered by Dexter Studio",
                 color = TextMuted,
                 fontSize = 11.sp,
                 lineHeight = 16.sp,
@@ -3169,10 +3234,10 @@ class MainActivity : ComponentActivity() {
                         shape = RoundedCornerShape(16.dp)
                     ) {
                         Column(Modifier.padding(18.dp)) {
-                            ProfileDetailRow("EMS Server URL", prefs.baseUrl)
+                            ProfileDetailRow("ConnectX Control URL", prefs.baseUrl)
                             HorizontalDivider(color = BorderSubtle, modifier = Modifier.padding(vertical = 10.dp))
 
-                            ProfileDetailRow("Connected Shops", "${prefs.connections().size} Shop(s)")
+                            ProfileDetailRow("Connected Workspaces", "${prefs.connections().size} Workspace(s)")
                             HorizontalDivider(color = BorderSubtle, modifier = Modifier.padding(vertical = 10.dp))
 
                             ProfileDetailRow("Active Device ID", conn?.devicePublicId ?: "—")
@@ -3210,7 +3275,7 @@ class MainActivity : ComponentActivity() {
                 title = { Text("Log out of ConnectX?", color = TextPrimary, fontWeight = FontWeight.Bold) },
                 text = {
                     Text(
-                        "SMS sending will pause on this phone until you sign in again. Connected shops remain registered so duplicate devices are avoided.",
+                        "SMS sending will pause on this phone until you sign in again. Connected workspaces remain registered so duplicate devices are avoided.",
                         color = TextSecondary,
                         fontSize = 13.sp,
                         lineHeight = 18.sp
@@ -3322,7 +3387,7 @@ class MainActivity : ComponentActivity() {
                 Text("Send a test SMS", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    "Confirm message dispatch for ${conn?.shopName ?: "this shop"} via SIM ${conn?.simCarrier ?: ""}.",
+                    "Confirm message dispatch for ${conn?.shopName ?: "this workspace"} via SIM ${conn?.simCarrier ?: ""}.",
                     color = TextSecondary,
                     fontSize = 13.sp
                 )
@@ -3413,9 +3478,9 @@ class MainActivity : ComponentActivity() {
                     .padding(horizontal = 22.dp)
                     .padding(bottom = 32.dp)
             ) {
-                Text("Switch active shop", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
+                Text("Switch active workspace", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
                 Text(
-                    "Messages and queues are kept completely isolated per shop.",
+                    "Messages and queues are kept completely isolated per workspace.",
                     color = TextSecondary,
                     fontSize = 13.sp,
                     modifier = Modifier.padding(top = 4.dp, bottom = 16.dp)
@@ -3492,7 +3557,7 @@ class MainActivity : ComponentActivity() {
             ) {
                 Text("Switch sending SIM", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
                 Text(
-                    "Select which SIM sends messages for ${conn?.shopName ?: "this shop"}.",
+                    "Select which SIM sends messages for ${conn?.shopName ?: "this workspace"}.",
                     color = TextSecondary,
                     fontSize = 13.sp,
                     modifier = Modifier.padding(top = 4.dp, bottom = 16.dp)
@@ -3673,7 +3738,7 @@ class MainActivity : ComponentActivity() {
                     Spacer(Modifier.height(12.dp))
 
                     Text(
-                        "SMS delivery from your selected SIM, plus secure read-only access to the selected shop’s outgoing EMS ConnectX emails. Compose and send email on the EMS website.",
+                        "SMS delivery from your selected SIM, plus secure read-only access to the selected workspace’s outgoing email history. Connected apps compose and send their own email.",
                         fontSize = 13.sp,
                         color = TextSecondary,
                         textAlign = TextAlign.Center,
@@ -3760,7 +3825,7 @@ class MainActivity : ComponentActivity() {
                     val notes = if (updateInfo != null && updateInfo.versionCode > APP_VERSION_CODE && updateInfo.releaseNotes.isNotBlank()) {
                         updateInfo.releaseNotes
                     } else {
-                        "• Separate SMS and read-only Email pages for the selected shop’s outgoing messages.\n• Dashboard shows SMS and email activity; SIM switching and manual SIM Balance live on SMS.\n• Administrator Profile and Test SMS remain in Settings; email is sent from EMS."
+                        "• Separate SMS and read-only Email pages for the selected workspace’s outgoing messages.\n• Dashboard shows SMS and email activity; SIM switching and manual SIM Balance live on SMS.\n• Administrator Profile and Test SMS remain in Settings; email is sent by your connected apps."
                     }
 
                     Text(
@@ -3811,7 +3876,7 @@ class MainActivity : ComponentActivity() {
                 if (checkingUpdates) {
                     ConnectXLoader(size = 18.dp, strokeWidth = 2.dp)
                     Spacer(Modifier.width(8.dp))
-                    Text("Checking EMS App Store…", fontWeight = FontWeight.SemiBold)
+                    Text("Checking ConnectX Releases…", fontWeight = FontWeight.SemiBold)
                 } else {
                     Icon(Icons.Outlined.Refresh, null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
@@ -3907,7 +3972,7 @@ class MainActivity : ComponentActivity() {
                 Spacer(Modifier.height(8.dp))
 
                 Text(
-                    "This update is required to continue using ConnectX and keep shop communication secure and reliable.",
+                    "This update is required to continue using ConnectX and keep workspace communication secure and reliable.",
                     fontSize = 13.sp,
                     color = TextSecondary,
                     textAlign = TextAlign.Center,
@@ -4012,11 +4077,11 @@ class MainActivity : ComponentActivity() {
             val request = Request.Builder().url(downloadUrl).get().build()
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful)
-                    throw IllegalStateException("APK download failed (HTTP ${response.code}). Check EMS App Store storage.")
-                val body = response.body ?: throw IllegalStateException("EMS returned an empty APK download.")
+                    throw IllegalStateException("APK download failed (HTTP ${response.code}). Check ConnectX release storage.")
+                val body = response.body ?: throw IllegalStateException("ConnectX returned an empty APK download.")
                 val mime = response.header("content-type").orEmpty()
                 if (mime.contains("text/html", true) || mime.contains("application/json", true))
-                    throw IllegalStateException("EMS returned a page instead of an APK. Ask the owner to re-upload the update.")
+                    throw IllegalStateException("ConnectX returned a page instead of an APK. Ask the platform owner to re-upload the update.")
                 val total = body.contentLength()
                 if (total > limit) throw IllegalStateException("Update APK exceeds 100 MB.")
                 val displayTotal = if (total > 0) total else expectedSize.coerceAtLeast(0L)
@@ -4058,7 +4123,7 @@ class MainActivity : ComponentActivity() {
             val build = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) archive.longVersionCode
                 else archive.versionCode.toLong()
             if (archive.packageName != packageName || build != expectedVersionCode.toLong() || build <= APP_VERSION_CODE)
-                throw IllegalStateException("APK package/build does not match the EMS release (${packageName}, build $expectedVersionCode).")
+                throw IllegalStateException("APK package/build does not match the ConnectX release (${packageName}, build $expectedVersionCode).")
             // Android's package installer also checks the signing certificate.
             return destFile
         } catch (error: Exception) {
