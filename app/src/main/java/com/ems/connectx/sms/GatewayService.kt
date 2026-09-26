@@ -25,7 +25,7 @@ class GatewayService : Service() {
         startForeground(42, notice("ConnectX is waiting for $shop SMS jobs."))
         timer?.cancel()
         timer = Timer("connectx-drain", true)
-        timer?.scheduleAtFixedRate(object : TimerTask() {
+        timer?.schedule(object : TimerTask() {
             override fun run() {
                 runCatching { QueueProcessor.drain(this@GatewayService) }
             }
@@ -45,7 +45,7 @@ class GatewayService : Service() {
         )
         return NotificationCompat.Builder(this, ConnectXApp.CHANNEL_GATEWAY)
             .setSmallIcon(R.drawable.ic_stat_sms)
-            .setContentTitle("ConnectX SMS gateway")
+            .setContentTitle("ConnectX · SMS delivery")
             .setContentText(text)
             .setContentIntent(open)
             .setOngoing(true)

@@ -2,12 +2,14 @@ package com.ems.connectx
 
 import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
 import android.telephony.SubscriptionInfo
+import android.telephony.TelephonyManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -40,23 +42,32 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
+import androidx.core.content.ContextCompat
 import com.ems.connectx.data.*
 import com.ems.connectx.sms.GatewayService
 import com.ems.connectx.sms.QueueProcessor
 import com.ems.connectx.sms.SmsSender
+import com.ems.connectx.sms.SimUssdClient
 import com.ems.connectx.ui.*
 import java.io.File
 import java.io.FileOutputStream
 import java.util.Locale
+import java.net.UnknownHostException
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import java.util.concurrent.TimeUnit
 
-const val APP_VERSION_NAME = "1.3.0"
-const val APP_VERSION_CODE = 13
+// Gradle is the single source of truth (also used by Android's package manager).
+val APP_VERSION_NAME get() = BuildConfig.VERSION_NAME
+val APP_VERSION_CODE get() = BuildConfig.VERSION_CODE
 
 fun Double.format(digits: Int): String = String.format(Locale.US, "%.${digits}f", this)
 
@@ -64,6 +75,12 @@ fun Double.format(digits: Int): String = String.format(Locale.US, "%.${digits}f"
 class MainActivity : ComponentActivity() {
     private lateinit var prefs: Prefs
     private lateinit var api: Api
+    private var resumeToken by mutableIntStateOf(0)
+
+    override fun onResume() {
+        super.onResume()
+        resumeToken++ // Re-check immediately when returning from background or installer.
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -85,6 +102,9 @@ class MainActivity : ComponentActivity() {
         var session by remember { mutableIntStateOf(0) }
         var updateInfo by remember { mutableStateOf<AppUpdateInfo?>(null) }
         var checkingUpdates by remember { mutableStateOf(false) }
+        var updateChecked by remember { mutableStateOf(false) }
+        var updateCheckError by remember { mutableStateOf<String?>(null) }
+        var dismissedBuild by remember { mutableIntStateOf(0) }
         var lastBackPressTime by remember { mutableLongStateOf(0L) }
         val scope = rememberCoroutineScope()
 
@@ -93,36 +113,47 @@ class MainActivity : ComponentActivity() {
         var wizardTargetUpdate by remember { mutableStateOf<AppUpdateInfo?>(null) }
         var wizardProgress by remember { mutableFloatStateOf(0f) }
         var wizardDownloadedBytes by remember { mutableLongStateOf(0L) }
-        var wizardTotalBytes by remember { mutableLongStateOf(8645200L) }
+        var wizardTotalBytes by remember { mutableLongStateOf(0L) }
         var wizardStatus by remember { mutableStateOf("idle") } // "idle", "downloading", "ready", "error"
         var wizardError by remember { mutableStateOf("") }
         var downloadedApkFile by remember { mutableStateOf<File?>(null) }
+        var downloadJob by remember { mutableStateOf<Job?>(null) }
 
         fun launchWizard(info: AppUpdateInfo) {
+            downloadJob?.cancel()
             wizardTargetUpdate = info
             showInstallWizard = true
+            downloadedApkFile = null
             wizardProgress = 0f
             wizardDownloadedBytes = 0L
-            wizardTotalBytes = if (info.apkSizeBytes > 0) info.apkSizeBytes else 8645200L
+            wizardTotalBytes = info.apkSizeBytes.coerceAtLeast(0L)
             wizardStatus = "downloading"
             wizardError = ""
 
-            scope.launch {
+            downloadJob = scope.launch {
                 try {
                     val apk = withContext(Dispatchers.IO) {
                         downloadUpdateApk(
                             downloadUrl = info.downloadUrl,
-                            fileName = info.apkFilename.ifBlank { "ConnectX-${info.latestVersion}.apk" }
+                            fileName = info.apkFilename.ifBlank { "ConnectX-${info.latestVersion}.apk" },
+                            expectedVersionCode = info.versionCode,
+                            expectedSize = info.apkSizeBytes
                         ) { progress, downloaded, total ->
                             wizardProgress = progress
                             wizardDownloadedBytes = downloaded
                             if (total > 0) wizardTotalBytes = total
                         }
                     }
+                    if (!showInstallWizard) {
+                        apk.delete()
+                        return@launch
+                    }
                     downloadedApkFile = apk
                     wizardStatus = "ready"
                     // Automatically trigger the Android system installation wizard!
                     installDownloadedApk(apk)
+                } catch (_: CancellationException) {
+                    // User closed the wizard; the partial APK is deleted below.
                 } catch (e: Exception) {
                     wizardStatus = "error"
                     wizardError = e.message ?: "Failed to download update"
@@ -130,17 +161,23 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // Automatic update check on app start
-        LaunchedEffect(Unit) {
-            withContext(Dispatchers.IO) {
+        // Public App Store: check on launch, after EMS URL is saved, on resume,
+        // and hourly while the UI is active. WorkManager checks in background.
+        LaunchedEffect(route, session, resumeToken) {
+            if (prefs.baseUrl.isBlank()) return@LaunchedEffect
+            while (true) {
                 try {
-                    val latest = api.checkUpdate(packageName)
-                    if (latest != null && latest.versionCode > APP_VERSION_CODE) {
-                        withContext(Dispatchers.Main) {
-                            updateInfo = latest
-                        }
-                    }
-                } catch (_: Exception) {}
+                    val latest = withContext(Dispatchers.IO) { api.checkUpdate(packageName, APP_VERSION_CODE) }
+                    updateInfo = latest.takeIf { it.versionCode > APP_VERSION_CODE }
+                    updateChecked = true
+                    updateCheckError = null
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    updateChecked = false
+                    updateCheckError = e.message ?: "Could not reach the EMS App Store."
+                }
+                delay(60 * 60 * 1000L)
             }
         }
 
@@ -150,6 +187,7 @@ class MainActivity : ComponentActivity() {
         // ═══════════════════════════════════════════════════════════════════
         BackHandler(enabled = true) {
             if (showInstallWizard && wizardStatus == "downloading") {
+                downloadJob?.cancel()
                 showInstallWizard = false
                 return@BackHandler
             }
@@ -166,12 +204,12 @@ class MainActivity : ComponentActivity() {
 
             when (route) {
                 "about" -> {
-                    tab = 2
+                    tab = 3
                     route = "home"
                 }
                 "shops" -> {
                     if (prefs.connections().any { it.setupComplete }) {
-                        tab = 2
+                        tab = 3
                         route = "home"
                     } else {
                         route = "login"
@@ -278,9 +316,9 @@ class MainActivity : ComponentActivity() {
 
                     Text(
                         when (wizardStatus) {
-                            "ready" -> "Update package prepared. The Android installer is ready to update your gateway."
+                            "ready" -> "Download complete. Android will check the APK signature. If it says ‘App not installed,’ ask the EMS owner for an APK signed with the same key as your current app."
                             "error" -> wizardError.ifBlank { "Could not download APK. Please check your network connection." }
-                            else -> "Downloading v${wizardTargetUpdate?.latestVersion ?: "1.4.0"} (Build ${wizardTargetUpdate?.versionCode ?: 14}) directly from EMS App Store…"
+                            else -> "Downloading v${wizardTargetUpdate?.latestVersion ?: APP_VERSION_NAME} (Build ${wizardTargetUpdate?.versionCode ?: APP_VERSION_CODE}) directly from EMS App Store…"
                         },
                         fontSize = 13.sp,
                         color = TextSecondary,
@@ -291,28 +329,32 @@ class MainActivity : ComponentActivity() {
                     Spacer(Modifier.height(20.dp))
 
                     if (wizardStatus == "downloading") {
-                        LinearProgressIndicator(
-                            progress = { wizardProgress },
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(8.dp)
-                                .clip(RoundedCornerShape(4.dp)),
-                            color = PrimaryBlue,
-                            trackColor = PearlSurface
-                        )
+                        if (wizardTotalBytes > 0) {
+                            LinearProgressIndicator(
+                                progress = { wizardProgress },
+                                modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp)),
+                                color = PrimaryBlue, trackColor = PearlSurface
+                            )
+                        } else {
+                            LinearProgressIndicator(
+                                modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp)),
+                                color = PrimaryBlue, trackColor = PearlSurface
+                            )
+                        }
                         Spacer(Modifier.height(10.dp))
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
                             Text(
-                                "${(wizardProgress * 100).toInt()}% Downloaded",
+                                if (wizardTotalBytes > 0) "${(wizardProgress * 100).toInt()}% Downloaded" else "Downloading…",
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.SemiBold,
                                 color = PrimaryBlue
                             )
                             Text(
-                                "${(wizardDownloadedBytes / (1024 * 1024.0)).format(1)} MB / ${(wizardTotalBytes / (1024 * 1024.0)).format(1)} MB",
+                                if (wizardTotalBytes > 0) "${(wizardDownloadedBytes / (1024 * 1024.0)).format(1)} / ${(wizardTotalBytes / (1024 * 1024.0)).format(1)} MB"
+                                else "${(wizardDownloadedBytes / (1024 * 1024.0)).format(1)} MB",
                                 fontSize = 12.sp,
                                 color = TextMuted
                             )
@@ -370,9 +412,9 @@ class MainActivity : ComponentActivity() {
         }
 
         // Optional Update Dialog (if update available and not mandatory)
-        if (updateInfo != null && !updateInfo!!.mandatory && updateInfo!!.versionCode > APP_VERSION_CODE && route != "about") {
+        if (updateInfo != null && !updateInfo!!.mandatory && updateInfo!!.versionCode > APP_VERSION_CODE && route != "about" && dismissedBuild != updateInfo!!.versionCode) {
             AlertDialog(
-                onDismissRequest = { updateInfo = null },
+                onDismissRequest = { dismissedBuild = updateInfo!!.versionCode },
                 title = {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Box(
@@ -436,6 +478,7 @@ class MainActivity : ComponentActivity() {
                 confirmButton = {
                     Button(
                         onClick = {
+                            dismissedBuild = updateInfo!!.versionCode
                             launchWizard(updateInfo!!)
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
@@ -448,7 +491,7 @@ class MainActivity : ComponentActivity() {
                 },
                 dismissButton = {
                     TextButton(
-                        onClick = { updateInfo = null },
+                        onClick = { dismissedBuild = updateInfo!!.versionCode },
                         colors = ButtonDefaults.textButtonColors(contentColor = TextSecondary)
                     ) {
                         Text("Later")
@@ -473,7 +516,7 @@ class MainActivity : ComponentActivity() {
             "shops" -> ShopListScreen(
                 onBack = {
                     if (prefs.connections().any { it.setupComplete }) {
-                        tab = 2
+                        tab = 3
                         route = "home"
                     } else {
                         route = "login"
@@ -502,7 +545,7 @@ class MainActivity : ComponentActivity() {
             "about" -> AboutScreen(
                 updateInfo = updateInfo,
                 onBack = {
-                    tab = 2
+                    tab = 3
                     route = "home"
                 },
                 onStartUpdate = { info -> launchWizard(info) },
@@ -510,22 +553,24 @@ class MainActivity : ComponentActivity() {
                     scope.launch {
                         checkingUpdates = true
                         try {
-                            val latest = withContext(Dispatchers.IO) { api.checkUpdate(packageName) }
-                            if (latest != null && latest.versionCode > APP_VERSION_CODE) {
-                                updateInfo = latest
-                                toast("New build v${latest.latestVersion} found!")
-                            } else {
-                                updateInfo = null
-                                toast("✓ ConnectX is up to date (v$APP_VERSION_NAME)")
-                            }
+                            val latest = withContext(Dispatchers.IO) { api.checkUpdate(packageName, APP_VERSION_CODE) }
+                            updateInfo = latest.takeIf { it.versionCode > APP_VERSION_CODE }
+                            updateChecked = true
+                            updateCheckError = null
+                            if (updateInfo != null) toast("New build v${latest.latestVersion} found!")
+                            else toast("ConnectX is up to date (v$APP_VERSION_NAME)")
                         } catch (e: Exception) {
-                            toast("Check failed: ${e.message}")
+                            updateChecked = false
+                            updateCheckError = e.message ?: "Could not reach the EMS App Store."
+                            toast("Update check failed: $updateCheckError")
                         } finally {
                             checkingUpdates = false
                         }
                     }
                 },
-                checkingUpdates = checkingUpdates
+                checkingUpdates = checkingUpdates,
+                updateChecked = updateChecked,
+                updateCheckError = updateCheckError
             )
             else -> key(session) {
                 HomeShell(
@@ -558,6 +603,16 @@ class MainActivity : ComponentActivity() {
     /* =====================================================================
      * MOBBIN-INSPIRED LIGHT ONBOARDING EXPERIENCE
      * ===================================================================== */
+    // Keep manual balance state on the SMS page, not inside a LazyColumn item.
+    // Scrolling history must not discard an in-progress USSD result.
+    private class BalanceUiState {
+        val catalog = mutableStateOf<CarrierBalanceConfig?>(null)
+        val pending = mutableStateOf<CarrierBalanceConfig?>(null)
+        val balance = mutableStateOf<String?>(null)
+        val status = mutableStateOf("Tap Refresh to check balance.")
+        val busy = mutableStateOf(false)
+    }
+
     data class OnboardingStep(
         val badge: String,
         val title: String,
@@ -571,20 +626,20 @@ class MainActivity : ComponentActivity() {
         val steps = remember {
             listOf(
                 OnboardingStep(
-                    badge = "HARDWARE SMS GATEWAY",
-                    title = "Turn this phone into your SMS gateway",
-                    subtitle = "Direct, local cellular dispatch for your EMS retail POS. Send transaction SMS messages instantly with no expensive third-party SMS markups.",
+                    badge = "CENTRAL COMMUNICATION",
+                    title = "SMS dispatch and EMS email history",
+                    subtitle = "ConnectX: Central Communication Gateway powered by Dexter Studio. Send SMS from your SIM and review outgoing EMS emails for your selected shop.",
                     icon = Icons.Outlined.Sensors,
                     features = listOf(
-                        Icons.Outlined.Bolt to "Direct cellular sending from your device's SIM card",
-                        Icons.Outlined.Sync to "Background sync service runs 24/7 without screen wake",
-                        Icons.Outlined.CheckCircle to "Automatic multipart message handling and delivery receipts"
+                        Icons.Outlined.Bolt to "Direct cellular SMS from your device's SIM",
+                        Icons.Outlined.Email to "Read-only EMS outgoing email history",
+                        Icons.Outlined.Sync to "Background SMS queue while the screen is off"
                     )
                 ),
                 OnboardingStep(
                     badge = "MULTI-STORE ROUTING",
                     title = "One phone, multiple shop branches",
-                    subtitle = "Manage multiple retail outlets on a single smartphone. Route outgoing messages through assigned SIM cards effortlessly.",
+                    subtitle = "Switch shops for both SMS and email history. Choose each shop’s sending SIM for SMS only; EMS handles outgoing email independently.",
                     icon = Icons.Outlined.Store,
                     features = listOf(
                         Icons.Outlined.SimCard to "Assign dedicated SIM carriers per shop location",
@@ -646,7 +701,7 @@ class MainActivity : ComponentActivity() {
                             color = TextPrimary
                         )
                         Text(
-                            "Android SMS Gateway",
+                            getString(R.string.tagline),
                             fontSize = 11.sp,
                             color = TextMuted
                         )
@@ -831,6 +886,7 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun LoginScreen(onOk: () -> Unit) {
         var url by remember { mutableStateOf(prefs.baseUrl) }
+        var urlError by remember { mutableStateOf<String?>(null) }
         var email by remember { mutableStateOf(prefs.adminEmail) }
         var password by remember { mutableStateOf("") }
         var loading by remember { mutableStateOf(false) }
@@ -894,9 +950,12 @@ class MainActivity : ComponentActivity() {
                 Column(Modifier.padding(18.dp)) {
                     OutlinedTextField(
                         value = url,
-                        onValueChange = { url = it },
+                        onValueChange = { url = it; urlError = null },
                         label = { Text("EMS Website URL") },
                         placeholder = { Text("https://your-ems.pages.dev") },
+                        supportingText = { Text(urlError ?: "Use the complete deployed EMS domain, not just https:/ or GitHub.",
+                            color = if (urlError != null) RoseText else TextMuted, fontSize = 11.sp) },
+                        isError = urlError != null,
                         leadingIcon = { Icon(Icons.Outlined.Language, null, tint = PrimaryBlue) },
                         modifier = Modifier.fillMaxWidth(),
                         singleLine = true,
@@ -936,9 +995,10 @@ class MainActivity : ComponentActivity() {
             ) {
                 TextButton(
                     onClick = {
-                        val u = url.trim().trimEnd('/')
-                        if (u.isBlank()) toast("Enter your EMS website URL first.")
-                        else startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("$u/#forgot")))
+                        val checked = runCatching { EmsSiteUrl.normalize(url) }
+                        val u = checked.getOrNull()
+                        if (u == null) urlError = checked.exceptionOrNull()?.message ?: EmsSiteUrl.HELP
+                        if (u != null) startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("$u/#forgot")))
                     },
                     colors = ButtonDefaults.textButtonColors(contentColor = PrimaryBlue)
                 ) {
@@ -950,13 +1010,18 @@ class MainActivity : ComponentActivity() {
 
             Button(
                 onClick = {
-                    scope.launch {
+                    val checked = runCatching { EmsSiteUrl.normalize(url) }
+                    val site = checked.getOrNull()
+                    if (site == null) urlError = checked.exceptionOrNull()?.message ?: EmsSiteUrl.HELP
+                    if (site != null) scope.launch {
                         loading = true
                         try {
-                            prefs.baseUrl = url
+                            prefs.baseUrl = site
                             withContext(Dispatchers.IO) { api.adminLogin(email.trim(), password) }
                             onOk()
                         } catch (e: Exception) {
+                            if (e is UnknownHostException || e.cause is UnknownHostException)
+                                urlError = e.message ?: "EMS website not found. Check the full deployed domain."
                             toast(e.message ?: "Sign in failed")
                         } finally {
                             loading = false
@@ -1556,13 +1621,20 @@ class MainActivity : ComponentActivity() {
                     NavigationBarItem(
                         selected = tab == 1,
                         onClick = { onTab(1) },
-                        icon = { Icon(Icons.Outlined.History, contentDescription = "Activity") },
-                        label = { Text("Activity") },
+                        icon = { Icon(Icons.Outlined.Sms, contentDescription = "SMS") },
+                        label = { Text("SMS") },
                         colors = colors
                     )
                     NavigationBarItem(
                         selected = tab == 2,
                         onClick = { onTab(2) },
+                        icon = { Icon(Icons.Outlined.Email, contentDescription = "Email") },
+                        label = { Text("Email") },
+                        colors = colors
+                    )
+                    NavigationBarItem(
+                        selected = tab == 3,
+                        onClick = { onTab(3) },
                         icon = { Icon(Icons.Outlined.Settings, contentDescription = "Settings") },
                         label = { Text("Settings") },
                         colors = colors
@@ -1577,8 +1649,10 @@ class MainActivity : ComponentActivity() {
                     .background(PureWhite)
             ) {
                 when (tab) {
-                    0 -> HomeTab(conn, onSession, updateInfo, onOpenUpdate)
-                    1 -> ActivityTab(conn)
+                    0 -> HomeTab(conn, updateInfo, onOpenUpdate, onSession,
+                        onOpenSms = { onTab(1) }, onOpenEmail = { onTab(2) })
+                    1 -> SmsTab(conn, onSession)
+                    2 -> EmailTab(conn)
                     else -> SettingsTab(conn, onAddShop, onLogout, onSession, updateInfo, onOpenAbout)
                 }
             }
@@ -1599,33 +1673,42 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun HomeTab(
         conn: Connection?,
-        onSession: () -> Unit,
         updateInfo: AppUpdateInfo? = null,
-        onOpenUpdate: () -> Unit = {}
+        onOpenUpdate: () -> Unit = {},
+        onSession: () -> Unit,
+        onOpenSms: () -> Unit,
+        onOpenEmail: () -> Unit
     ) {
-        var stats by remember {
-            mutableStateOf(
-                HomeStats(
-                    shopName = conn?.shopName.orEmpty(),
-                    shopAddress = conn?.shopAddress.orEmpty(),
-                    adminName = conn?.adminName.orEmpty(),
-                    adminEmail = conn?.adminEmail.orEmpty(),
-                    adminCode = conn?.adminCode.orEmpty()
-                )
-            )
+        var stats by remember(conn?.shopId) {
+            mutableStateOf(HomeStats(shopName = conn?.shopName.orEmpty(),
+                shopAddress = conn?.shopAddress.orEmpty()))
         }
-        var loadingStats by remember { mutableStateOf(false) }
+        var emailStats by remember(conn?.shopId) { mutableStateOf<EmailStats?>(null) }
+        var loadingStats by remember(conn?.shopId) { mutableStateOf(true) }
+        var loadingEmail by remember(conn?.shopId) { mutableStateOf(true) }
+        var smsError by remember(conn?.shopId) { mutableStateOf<String?>(null) }
+        var emailError by remember(conn?.shopId) { mutableStateOf<String?>(null) }
+        var retry by remember { mutableIntStateOf(0) }
         var showShop by remember { mutableStateOf(false) }
-        var showSim by remember { mutableStateOf(false) }
-        var showTest by remember { mutableStateOf(false) }
 
-        LaunchedEffect(conn?.shopId) {
+        LaunchedEffect(conn?.shopId, retry) {
             if (conn == null) return@LaunchedEffect
             loadingStats = true
-            runCatching {
-                stats = withContext(Dispatchers.IO) { api.stats(conn.shopId) }
+            loadingEmail = true
+            smsError = null
+            emailError = null
+            launch {
+                try { stats = withContext(Dispatchers.IO) { api.stats(conn.shopId) } }
+                catch (e: CancellationException) { throw e }
+                catch (e: Exception) { smsError = e.message ?: "SMS statistics unavailable." }
+                finally { loadingStats = false }
             }
-            loadingStats = false
+            launch {
+                try { emailStats = withContext(Dispatchers.IO) { api.emailStats(conn.shopId) } }
+                catch (e: CancellationException) { throw e }
+                catch (e: Exception) { emailError = e.message ?: "Email statistics unavailable. Update EMS." }
+                finally { loadingEmail = false }
+            }
         }
 
         Column(
@@ -1711,7 +1794,7 @@ class MainActivity : ComponentActivity() {
                                 .padding(horizontal = 8.dp, vertical = 3.dp)
                         ) {
                             Text(
-                                "CONNECTX GATEWAY",
+                                "CONNECTX · COMMUNICATION",
                                 color = PrimaryBlue,
                                 fontSize = 10.sp,
                                 fontWeight = FontWeight.Bold,
@@ -1730,9 +1813,13 @@ class MainActivity : ComponentActivity() {
                     }
 
                     Spacer(Modifier.height(8.dp))
+                    Text(getString(R.string.brand_full), color = TextSecondary,
+                        fontSize = 12.sp, lineHeight = 17.sp)
+                    Spacer(Modifier.height(12.dp))
+                    Text("Active shop", color = TextMuted, fontSize = 11.sp)
 
                     Text(
-                        text = stats.shopName.ifBlank { conn?.shopName ?: "ConnectX Gateway" },
+                        text = stats.shopName.ifBlank { conn?.shopName ?: "ConnectX" },
                         color = TextPrimary,
                         fontSize = 24.sp,
                         fontWeight = FontWeight.Bold,
@@ -1761,182 +1848,263 @@ class MainActivity : ComponentActivity() {
                         )
                         Spacer(Modifier.width(8.dp))
                         Text(
-                            text = if (prefs.gatewayEnabled) "Online · Active SMS Gateway" else "Gateway Paused",
+                            text = if (prefs.gatewayEnabled) "SMS dispatch active" else "SMS dispatch paused · Email history remains available",
                             color = if (prefs.gatewayEnabled) AccentEmerald else TextSecondary,
                             fontSize = 13.sp,
                             fontWeight = FontWeight.Medium
                         )
                     }
 
-                    Spacer(Modifier.height(16.dp))
 
-                    // Active Sending SIM Card Container
-                    AppCard(
-                        onClick = { showSim = true },
-                        containerColor = PearlBg,
-                        borderColor = BorderSubtle,
-                        shape = RoundedCornerShape(12.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(34.dp)
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(PureWhite)
-                                    .border(1.dp, BorderSubtle, RoundedCornerShape(8.dp)),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Icon(Icons.Outlined.SimCard, null, tint = PrimaryBlue, modifier = Modifier.size(18.dp))
-                            }
-                            Spacer(Modifier.width(12.dp))
-                            Column(Modifier.weight(1f)) {
-                                Text("Sending SIM Number", color = TextMuted, fontSize = 11.sp)
-                                Text(
-                                    text = listOfNotNull(
-                                        conn?.simCarrier?.ifBlank { null },
-                                        conn?.phoneNumber?.ifBlank { "Tap to configure SIM" }
-                                    ).joinToString(" · "),
-                                    color = TextPrimary,
-                                    fontSize = 13.sp,
-                                    fontWeight = FontWeight.SemiBold
-                                )
-                            }
-                            Icon(Icons.Outlined.ChevronRight, null, tint = TextMuted, modifier = Modifier.size(18.dp))
-                        }
-                    }
                 }
             }
 
             Spacer(Modifier.height(14.dp))
 
-            // 3-Column Metrics Counters
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                MetricCard("Sent Today", stats.sent.toString(), AccentEmerald, Modifier.weight(1f))
-                MetricCard("Queued", stats.pending.toString(), AccentAmber, Modifier.weight(1f))
-                MetricCard("Failed", stats.failed.toString(), AccentRose, Modifier.weight(1f))
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Outlined.Sms, null, tint = PrimaryBlue)
+                    Spacer(Modifier.width(8.dp))
+                    Text("SMS · Local SIM", fontWeight = FontWeight.Bold, fontSize = 17.sp,
+                        color = TextPrimary)
+                }
+                TextButton(onClick = onOpenSms) { Text("Open SMS →") }
             }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                MetricCard("Sent today", if (loadingStats || smsError != null) "—" else stats.sent.toString(),
+                    AccentEmerald, Modifier.weight(1f))
+                MetricCard("Queued", if (loadingStats || smsError != null) "—" else stats.pending.toString(),
+                    AccentAmber, Modifier.weight(1f))
+                MetricCard("Failed", if (loadingStats || smsError != null) "—" else stats.failed.toString(),
+                    AccentRose, Modifier.weight(1f))
+            }
+            if (smsError != null) Text("SMS: $smsError", color = RoseText, fontSize = 12.sp,
+                modifier = Modifier.padding(top = 8.dp))
 
-            Spacer(Modifier.height(14.dp))
-
-            // Quick Actions & Administrator Summary
-            AppCard(
-                containerColor = PureWhite,
-                borderColor = BorderSubtle,
-                shape = RoundedCornerShape(18.dp)
-            ) {
-                Column(Modifier.padding(18.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Box(
-                                modifier = Modifier
-                                    .size(36.dp)
-                                    .clip(CircleShape)
-                                    .background(PrimarySubtle)
-                                    .border(1.dp, Color(0xFFBFDBFE), CircleShape),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Icon(Icons.Outlined.AdminPanelSettings, null, tint = PrimaryBlue, modifier = Modifier.size(20.dp))
-                            }
-                            Spacer(Modifier.width(10.dp))
-                            Column {
-                                Text("Administrator", color = TextMuted, fontSize = 11.sp)
-                                Text(
-                                    stats.adminName.ifBlank { conn?.adminName.orEmpty() }.ifBlank { "Administrator" },
-                                    fontWeight = FontWeight.Bold,
-                                    fontSize = 15.sp,
-                                    color = TextPrimary
-                                )
-                            }
+            Spacer(Modifier.height(18.dp))
+            HorizontalDivider(color = BorderSubtle)
+            Spacer(Modifier.height(10.dp))
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Outlined.Email, null, tint = AccentPurple)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Email · EMS ConnectX", fontWeight = FontWeight.Bold, fontSize = 17.sp,
+                        color = TextPrimary)
+                }
+                TextButton(onClick = onOpenEmail) { Text("Open Email →") }
+            }
+            Text("Outgoing history for this shop · read-only", color = TextSecondary,
+                fontSize = 12.sp, modifier = Modifier.padding(bottom = 10.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                MetricCard("Sent today", if (loadingEmail || emailError != null) "—" else (emailStats?.sent?.toString() ?: "—"),
+                    AccentEmerald, Modifier.weight(1f))
+                MetricCard("Pending", if (loadingEmail || emailError != null) "—" else (emailStats?.pending?.toString() ?: "—"),
+                    AccentAmber, Modifier.weight(1f))
+                MetricCard("Failed", if (loadingEmail || emailError != null) "—" else (emailStats?.failed?.toString() ?: "—"),
+                    AccentRose, Modifier.weight(1f))
+            }
+            if (emailError != null) {
+                Text("Email: $emailError · Check connection and deploy the matching EMS API.",
+                    color = RoseText, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
+            } else if (emailStats?.latest != null) {
+                val latest = emailStats!!.latest!!
+                AppCard(onClick = onOpenEmail, containerColor = PearlBg,
+                    borderColor = BorderSubtle, shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.padding(top = 12.dp)) {
+                    Column(Modifier.padding(14.dp)) {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically) {
+                            Text("Latest outgoing email", fontSize = 11.sp, color = TextMuted)
+                            StatusPill(latest.status)
                         }
-
-                        val adminCode = stats.adminCode.ifBlank { conn?.adminCode.orEmpty() }
-                        if (adminCode.isNotBlank()) {
-                            Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(6.dp))
-                                    .background(PrimarySubtle)
-                                    .border(1.dp, Color(0xFFBFDBFE), RoundedCornerShape(6.dp))
-                                    .padding(horizontal = 8.dp, vertical = 2.dp)
-                            ) {
-                                Text(
-                                    if (adminCode.startsWith("ADMIN-") || adminCode.startsWith("#")) adminCode else "#$adminCode",
-                                    color = PrimaryBlue,
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.SemiBold
-                                )
-                            }
-                        }
-                    }
-
-                    val email = stats.adminEmail.ifBlank { conn?.adminEmail.orEmpty() }
-                    if (email.isNotBlank()) {
-                        Text(
-                            email,
-                            color = TextSecondary,
-                            fontSize = 12.sp,
-                            modifier = Modifier.padding(top = 4.dp, start = 46.dp)
-                        )
-                    }
-
-                    Spacer(Modifier.height(14.dp))
-                    HorizontalDivider(color = BorderSubtle)
-                    Spacer(Modifier.height(14.dp))
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column {
-                            Text("Last SMS Activity", color = TextMuted, fontSize = 11.sp)
-                            Text(
-                                prettyTime(stats.lastActivity) ?: "No messages today",
-                                fontSize = 13.sp,
-                                color = TextPrimary,
-                                fontWeight = FontWeight.Medium
-                            )
-                        }
-
-                        Button(
-                            onClick = { showTest = true },
-                            shape = RoundedCornerShape(10.dp),
-                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = PearlSurface,
-                                contentColor = TextPrimary
-                            )
-                        ) {
-                            Icon(Icons.Outlined.Send, null, tint = PrimaryBlue, modifier = Modifier.size(14.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text("Test SMS", fontSize = 12.sp)
-                        }
+                        Text(latest.subject, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
+                            color = TextPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text("To: ${latest.toEmails.joinToString().ifBlank { "—" }} · ${prettyTime(latest.sentAt.ifBlank { latest.createdAt }) ?: ""}",
+                            color = TextSecondary, fontSize = 11.sp, maxLines = 2,
+                            overflow = TextOverflow.Ellipsis)
                     }
                 }
+            } else if (!loadingEmail) {
+                Text("No outgoing email history for this shop.", color = TextMuted,
+                    fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
             }
 
+            if (smsError != null || emailError != null) {
+                TextButton(onClick = { retry++ }, modifier = Modifier.padding(top = 8.dp)) {
+                    Icon(Icons.Outlined.Refresh, null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Retry statistics")
+                }
+            }
             Spacer(Modifier.height(20.dp))
-            Text(
-                "Powered by Dexter Studio",
-                color = TextMuted,
-                fontSize = 11.sp,
-                modifier = Modifier.fillMaxWidth(),
-                textAlign = TextAlign.Center
-            )
+            Text(getString(R.string.powered_by), color = TextMuted, fontSize = 11.sp,
+                modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center)
         }
 
         if (showShop) ShopSwitcher(onClose = { showShop = false }, onPicked = { showShop = false; onSession() })
-        if (showSim) SimSwitcher(conn, onClose = { showSim = false }, onPicked = { showSim = false; onSession() })
-        if (showTest) TestSheet(conn) { showTest = false }
+    }
+
+    @Composable
+    private fun SendingSimCard(conn: Connection?, onSwitch: () -> Unit) {
+        AppCard(onClick = onSwitch, containerColor = PureWhite, borderColor = BorderSubtle,
+            shape = RoundedCornerShape(16.dp)) {
+            Row(Modifier.fillMaxWidth().padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Outlined.SimCard, null, tint = PrimaryBlue, modifier = Modifier.size(28.dp))
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("Sending SIM · Tap to switch", fontSize = 12.sp, color = TextSecondary)
+                    Text(listOfNotNull(conn?.simCarrier?.ifBlank { null },
+                        conn?.phoneNumber?.ifBlank { null }).joinToString(" · ")
+                        .ifBlank { "Select a sending SIM" },
+                        fontWeight = FontWeight.SemiBold, color = TextPrimary,
+                        fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+                Icon(Icons.Outlined.ChevronRight, null, tint = TextMuted)
+            }
+        }
+    }
+
+    /** Only the selected sending SIM may be queried. Never call USSD on entry
+     * or in a background worker: the user explicitly taps Refresh. */
+    @Composable
+    private fun SimBalanceCard(conn: Connection?, state: BalanceUiState,
+        scope: kotlinx.coroutines.CoroutineScope) {
+        val selectedSim = SmsSender.sims(this@MainActivity)
+            .firstOrNull { it.subscriptionId == conn?.simSubscriptionId }
+        val mccMnc = selectedSim?.let { sim ->
+            runCatching {
+                getSystemService(TelephonyManager::class.java)
+                    ?.createForSubscriptionId(sim.subscriptionId)?.simOperator.orEmpty()
+            }.getOrDefault("")
+        }.orEmpty().takeIf { it.matches(Regex("[0-9]{5,6}")) }.orEmpty()
+        val simName = selectedSim?.carrierName?.toString().orEmpty().ifBlank {
+            if (selectedSim == null) "No active sending SIM"
+            else conn?.simCarrier.orEmpty().ifBlank { "Unknown carrier" }
+        }
+        val phone = if (selectedSim == null) "" else
+            (runCatching { selectedSim.number.takeIf { it.isNotBlank() } }.getOrNull()
+                ?: conn?.phoneNumber.orEmpty())
+        val masked = remember(phone) {
+            val digits = phone.filter { it.isDigit() }
+            if (digits.length < 8) "Not available"
+            else digits.take(3) + "X".repeat((digits.length - 3).coerceAtMost(12))
+        }
+        var catalog by state.catalog
+        var pending by state.pending
+        var balance by state.balance
+        var status by state.status
+        var busy by state.busy
+
+        suspend fun querySelectedSim(config: CarrierBalanceConfig) {
+            val shop = conn ?: return
+            val sim = selectedSim ?: return
+            if (prefs.active()?.shopId != shop.shopId ||
+                prefs.active()?.simSubscriptionId != sim.subscriptionId) {
+                status = "Balance unavailable"
+                return
+            }
+            status = "Checking SIM balance…"
+            val reply = SimUssdClient.request(this@MainActivity, sim.subscriptionId, config.balanceCode)
+            if (prefs.active()?.shopId != shop.shopId ||
+                prefs.active()?.simSubscriptionId != sim.subscriptionId) {
+                status = "Balance unavailable"
+                return
+            }
+            balance = withContext(Dispatchers.Default) {
+                BalanceReplyParser.balance(reply, config.balancePattern)
+            }
+            status = if (balance == null) "Balance unavailable" else "Updated from SIM"
+        }
+
+        val permissionRequest = rememberLauncherForActivityResult(
+            ActivityResultContracts.RequestPermission()
+        ) { granted ->
+            val config = pending
+            pending = null
+            if (granted && config != null) {
+                busy = true
+                scope.launch {
+                    try { querySelectedSim(config) }
+                    catch (e: CancellationException) { throw e }
+                    catch (_: Exception) { status = "Balance unavailable" }
+                    finally { busy = false }
+                }
+            } else status = "Balance unavailable"
+        }
+
+        fun refresh() {
+            val shop = conn
+            if (busy || shop == null || selectedSim == null) {
+                if (selectedSim == null) status = "Balance unavailable"
+                return
+            }
+            busy = true
+            balance = null
+            catalog = null
+            scope.launch {
+                try {
+                    // Re-read the owner catalog on every tap; no bundled USSD code.
+                    val config = withContext(Dispatchers.IO) {
+                        api.simCarrier(shop.shopId, mccMnc, simName)
+                    }
+                    catalog = config
+                    if (config == null) {
+                        status = "Balance unavailable"
+                    } else if (ContextCompat.checkSelfPermission(
+                            this@MainActivity, Manifest.permission.CALL_PHONE
+                        ) != PackageManager.PERMISSION_GRANTED
+                    ) {
+                        pending = config
+                        status = "Allow Phone permission to check balance."
+                        permissionRequest.launch(Manifest.permission.CALL_PHONE)
+                    } else {
+                        querySelectedSim(config)
+                    }
+                } catch (e: CancellationException) { throw e }
+                catch (_: Exception) { status = "Balance unavailable" }
+                finally { busy = false }
+            }
+        }
+
+        AppCard(
+            containerColor = PureWhite,
+            borderColor = BorderSubtle,
+            shape = RoundedCornerShape(18.dp)
+        ) {
+            Column(Modifier.padding(18.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Outlined.SimCard, contentDescription = null, tint = PrimaryBlue,
+                        modifier = Modifier.size(21.dp))
+                    Spacer(Modifier.width(9.dp))
+                    Text("SIM Balance", fontWeight = FontWeight.Bold,
+                        fontSize = 16.sp, color = TextPrimary)
+                }
+                Spacer(Modifier.height(12.dp))
+                Text("Carrier: ${catalog?.name ?: simName}", fontSize = 13.sp, color = TextPrimary)
+                Text("Number: $masked", fontSize = 13.sp, color = TextSecondary)
+                if (catalog == null && mccMnc.isNotBlank())
+                    Text("SIM MCC/MNC: $mccMnc", fontSize = 11.sp, color = TextMuted)
+                Spacer(Modifier.height(12.dp))
+                if (balance != null) {
+                    Text("Balance: ৳$balance", fontSize = 15.sp,
+                        fontWeight = FontWeight.SemiBold, color = TextPrimary)
+                }
+                Text(status, fontSize = 12.sp,
+                    color = if (status == "Balance unavailable") RoseText else TextMuted,
+                    modifier = Modifier.padding(top = 5.dp, bottom = 12.dp))
+                Button(onClick = { refresh() }, enabled = !busy && selectedSim != null,
+                    shape = RoundedCornerShape(10.dp)) {
+                    if (busy) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp,
+                        color = Color.White)
+                    else Icon(Icons.Outlined.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(7.dp))
+                    Text(if (busy) "Checking…" else "Refresh")
+                }
+            }
+        }
     }
 
     @Composable
@@ -1966,52 +2134,57 @@ class MainActivity : ComponentActivity() {
     }
 
     /* =====================================================================
-     * ACTIVITY TAB (Light Theme with Message Types & Queued Job Cancel Action)
+     * SMS TAB — manual SIM controls and outgoing SMS history
      * ===================================================================== */
     @Composable
-    private fun ActivityTab(conn: Connection?) {
+    private fun SmsTab(conn: Connection?, onSession: () -> Unit) {
         var range by remember { mutableStateOf("today") }
-        var items by remember { mutableStateOf<List<ActivityItem>>(emptyList()) }
-        var loading by remember { mutableStateOf(false) }
+        var items by remember(conn?.shopId) { mutableStateOf<List<ActivityItem>>(emptyList()) }
+        var loading by remember { mutableStateOf(true) }
+        var error by remember { mutableStateOf<String?>(null) }
+        var reload by remember { mutableIntStateOf(0) }
+        var showSim by remember { mutableStateOf(false) }
         var open by remember { mutableStateOf<ActivityItem?>(null) }
-        var cancellingJobId by remember { mutableStateOf<String?>(null) }
+        var cancelling by remember { mutableStateOf(false) }
         var jobToCancel by remember { mutableStateOf<ActivityItem?>(null) }
         val scope = rememberCoroutineScope()
+        val currentCarrier = SmsSender.sims(this@MainActivity)
+            .firstOrNull { it.subscriptionId == conn?.simSubscriptionId }
+            ?.carrierName?.toString().orEmpty()
+        val balanceState = remember(conn?.shopId, conn?.simSubscriptionId,
+            conn?.simCarrier, currentCarrier) { BalanceUiState() }
 
-        fun refreshActivity() {
-            if (conn == null) return
-            scope.launch {
-                loading = true
-                runCatching {
-                    items = withContext(Dispatchers.IO) { api.activity(conn.shopId, range) }
-                }
-                loading = false
-            }
+        LaunchedEffect(conn?.shopId, range, reload) {
+            if (conn == null) return@LaunchedEffect
+            loading = true
+            error = null
+            items = emptyList()
+            try { items = withContext(Dispatchers.IO) { api.activity(conn.shopId, range) } }
+            catch (e: CancellationException) { throw e }
+            catch (e: Exception) { error = e.message ?: "SMS history is unavailable." }
+            finally { loading = false }
         }
 
-        LaunchedEffect(conn?.shopId, range) {
-            refreshActivity()
-        }
-
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(PureWhite)
-                .statusBarsPadding()
-                .padding(horizontal = 16.dp, vertical = 12.dp)
+        LazyColumn(
+            modifier = Modifier.fillMaxSize().background(PureWhite).statusBarsPadding()
+                .padding(horizontal = 16.dp),
+            contentPadding = PaddingValues(vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
+            item {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Column {
-                    Text("SMS Activity", fontSize = 26.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
-                    Text(conn?.shopName ?: "All Shops", color = TextSecondary, fontSize = 12.sp)
+                    Text("SMS", fontSize = 26.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
+                    Text("${conn?.shopName ?: "No paired shop"} · SIM dispatch and history",
+                        color = TextSecondary, fontSize = 12.sp)
                 }
 
                 IconButton(
-                    onClick = { refreshActivity() },
+                    onClick = { reload++ },
                     modifier = Modifier
                         .size(36.dp)
                         .clip(CircleShape)
@@ -2021,6 +2194,14 @@ class MainActivity : ComponentActivity() {
                     Icon(Icons.Outlined.Refresh, "Refresh", tint = PrimaryBlue, modifier = Modifier.size(18.dp))
                 }
             }
+
+            Spacer(Modifier.height(12.dp))
+            SendingSimCard(conn, onSwitch = { showSim = true })
+            Spacer(Modifier.height(10.dp))
+            SimBalanceCard(conn, balanceState, scope)
+            Spacer(Modifier.height(16.dp))
+            Text("SMS history", color = TextPrimary, fontWeight = FontWeight.Bold,
+                fontSize = 16.sp)
 
             // Filter Chips Bar
             Row(
@@ -2082,6 +2263,9 @@ class MainActivity : ComponentActivity() {
                         )
                     }
                 }
+            } else if (error != null) {
+                Text("Could not load SMS history: $error", color = RoseText, fontSize = 13.sp)
+                TextButton(onClick = { reload++ }) { Text("Try again") }
             } else if (items.isEmpty()) {
                 AppCard(
                     modifier = Modifier
@@ -2105,15 +2289,10 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+            } // Header and SIM controls scroll together with SMS history.
 
-            LazyColumn(
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-                modifier = Modifier.weight(1f)
-            ) {
-                items(items, key = { it.id }) { row ->
-                    val isQueued = row.status.equals("queued", ignoreCase = true) ||
-                                   row.status.equals("pending", ignoreCase = true) ||
-                                   row.status.equals("sending", ignoreCase = true)
+            items(items, key = { it.id }) { row ->
+                    val isQueued = row.status.equals("queued", ignoreCase = true)
 
                     AppCard(
                         onClick = { open = row },
@@ -2212,8 +2391,10 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 }
-            }
         }
+
+        if (showSim) SimSwitcher(conn, onClose = { showSim = false },
+            onPicked = { showSim = false; onSession() })
 
         // Cancel Confirmation Dialog
         jobToCancel?.let { target ->
@@ -2235,23 +2416,26 @@ class MainActivity : ComponentActivity() {
                         onClick = {
                             val c = conn ?: return@Button
                             scope.launch {
-                                cancellingJobId = target.id
-                                val ok = withContext(Dispatchers.IO) {
-                                    api.cancelJob(c.shopId, target.id)
+                                cancelling = true
+                                try {
+                                    val ok = withContext(Dispatchers.IO) { api.cancelJob(c.shopId, target.id) }
+                                    if (ok) {
+                                        items = items.filterNot { it.id == target.id }
+                                        if (open?.id == target.id) open = null
+                                        toast("Queued SMS cancelled.")
+                                        reload++
+                                    } else toast("SMS cancellation was not confirmed. Refresh and try again.")
+                                } catch (e: CancellationException) { throw e }
+                                catch (e: Exception) {
+                                    toast(e.message ?: "SMS cancellation failed. It may already be sending.")
+                                    reload++
+                                } finally {
+                                    cancelling = false
+                                    jobToCancel = null
                                 }
-                                if (ok) {
-                                    toast("Queued SMS cancelled.")
-                                    items = items.map {
-                                        if (it.id == target.id) it.copy(status = "cancelled") else it
-                                    }
-                                } else {
-                                    toast("Could not cancel SMS.")
-                                }
-                                cancellingJobId = null
-                                jobToCancel = null
-                                if (open?.id == target.id) open = null
                             }
                         },
+                        enabled = !cancelling,
                         colors = ButtonDefaults.buttonColors(
                             containerColor = AccentRose,
                             contentColor = Color.White
@@ -2274,9 +2458,7 @@ class MainActivity : ComponentActivity() {
 
         // Detail Bottom Sheet
         open?.let { row ->
-            val isQueued = row.status.equals("queued", ignoreCase = true) ||
-                           row.status.equals("pending", ignoreCase = true) ||
-                           row.status.equals("sending", ignoreCase = true)
+            val isQueued = row.status.equals("queued", ignoreCase = true)
 
             ModalBottomSheet(
                 onDismissRequest = { open = null },
@@ -2378,6 +2560,230 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    /* =====================================================================
+     * EMAIL TAB — read-only, paginated EMS outgoing history for active shop
+     * ===================================================================== */
+    @Composable
+    private fun EmailTab(conn: Connection?) {
+        var emails by remember(conn?.shopId) { mutableStateOf<List<EmailItem>>(emptyList()) }
+        var nextPage by remember(conn?.shopId) { mutableIntStateOf(0) }
+        var snapshot by remember(conn?.shopId) { mutableStateOf("") }
+        var hasMore by remember(conn?.shopId) { mutableStateOf(false) }
+        var loading by remember(conn?.shopId) { mutableStateOf(false) }
+        var error by remember(conn?.shopId) { mutableStateOf<String?>(null) }
+        var selectedId by remember(conn?.shopId) { mutableStateOf<String?>(null) }
+        var detail by remember(conn?.shopId) { mutableStateOf<EmailItem?>(null) }
+        var detailLoading by remember(conn?.shopId) { mutableStateOf(false) }
+        var detailError by remember(conn?.shopId) { mutableStateOf<String?>(null) }
+        val scope = rememberCoroutineScope()
+
+        suspend fun load(reset: Boolean) {
+            val shop = conn ?: return
+            if (loading || (!reset && !hasMore)) return
+            val target = if (reset) 0 else nextPage
+            val anchor = if (reset) "" else snapshot
+            loading = true
+            error = null
+            if (reset) {
+                emails = emptyList()
+                nextPage = 0
+                hasMore = false
+            }
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    api.emailPage(shop.shopId, target, anchor)
+                }
+                if (prefs.active()?.shopId != shop.shopId) return
+                emails = if (reset) result.items else (emails + result.items).distinctBy { it.id }
+                nextPage = result.page + 1
+                hasMore = result.hasMore
+                snapshot = result.snapshot
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) {
+                error = e.message ?: "Could not load email history. Check EMS and retry."
+            } finally { loading = false }
+        }
+
+        LaunchedEffect(conn?.shopId) { load(reset = true) }
+        LaunchedEffect(conn?.shopId, selectedId) {
+            val id = selectedId ?: return@LaunchedEffect
+            val shop = conn ?: return@LaunchedEffect
+            detail = null
+            detailError = null
+            detailLoading = true
+            try { detail = withContext(Dispatchers.IO) { api.emailDetail(shop.shopId, id) } }
+            catch (e: CancellationException) { throw e }
+            catch (e: Exception) { detailError = e.message ?: "Email details unavailable." }
+            finally { detailLoading = false }
+        }
+
+        LazyColumn(
+            modifier = Modifier.fillMaxSize().background(PureWhite).statusBarsPadding()
+                .padding(horizontal = 16.dp),
+            contentPadding = PaddingValues(top = 16.dp, bottom = 24.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            item {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Email", fontWeight = FontWeight.Bold, fontSize = 26.sp,
+                            color = TextPrimary)
+                        Text(conn?.shopName ?: "No paired shop", fontSize = 12.sp,
+                            color = TextSecondary)
+                    }
+                    IconButton(onClick = { scope.launch { load(reset = true) } },
+                        enabled = !loading && conn != null,
+                        modifier = Modifier.size(36.dp).clip(CircleShape)
+                            .background(PearlSurface).border(1.dp, BorderSubtle, CircleShape)) {
+                        Icon(Icons.Outlined.Refresh, "Refresh email", tint = PrimaryBlue,
+                            modifier = Modifier.size(18.dp))
+                    }
+                }
+                Spacer(Modifier.height(12.dp))
+                AppCard(containerColor = PrimarySubtle, borderColor = Color(0xFFBFDBFE),
+                    shape = RoundedCornerShape(14.dp)) {
+                    Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Outlined.MarkEmailRead, null, tint = PrimaryBlue)
+                        Spacer(Modifier.width(10.dp))
+                        Text("EMS ConnectX outgoing email history for this shop. View sent, failed and pending messages here; send new email from EMS.",
+                            color = TextPrimary, fontSize = 12.sp, lineHeight = 18.sp)
+                    }
+                }
+                Spacer(Modifier.height(10.dp))
+                Text("Messages", fontSize = 16.sp, fontWeight = FontWeight.Bold,
+                    color = TextPrimary)
+            }
+
+            items(emails, key = { it.id }) { row ->
+                AppCard(onClick = { selectedId = row.id }, containerColor = PureWhite,
+                    borderColor = BorderSubtle, shape = RoundedCornerShape(14.dp)) {
+                    Column(Modifier.fillMaxWidth().padding(15.dp)) {
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text(row.subject, fontSize = 15.sp, fontWeight = FontWeight.SemiBold,
+                                color = TextPrimary, maxLines = 2, overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f))
+                            Spacer(Modifier.width(8.dp))
+                            StatusPill(row.status)
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        Text("To: ${row.toEmails.joinToString().ifBlank { "—" }}",
+                            fontSize = 12.sp, color = TextSecondary, maxLines = 2,
+                            overflow = TextOverflow.Ellipsis)
+                        Text(prettyTime(row.sentAt.ifBlank { row.createdAt }) ?: "",
+                            fontSize = 11.sp, color = TextMuted,
+                            modifier = Modifier.padding(top = 6.dp))
+                        if (row.error != null) Text(row.error, color = RoseText, fontSize = 11.sp,
+                            maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+            }
+
+            item {
+                if (loading) {
+                    Box(Modifier.fillMaxWidth().padding(18.dp), contentAlignment = Alignment.Center) {
+                        ConnectXLoader(size = 28.dp)
+                    }
+                } else if (error != null) {
+                    AppCard(containerColor = AccentRoseBg, borderColor = AccentRoseBorder) {
+                        Column(Modifier.fillMaxWidth().padding(16.dp)) {
+                            Text("Email history unavailable: $error", color = RoseText, fontSize = 13.sp)
+                            Text("Check EMS connectivity; deploy the v1.6 device API if needed.",
+                                color = TextSecondary, fontSize = 12.sp)
+                            TextButton(onClick = { scope.launch { load(reset = emails.isEmpty()) } }) {
+                                Text("Try again")
+                            }
+                        }
+                    }
+                } else if (emails.isEmpty()) {
+                    AppCard(containerColor = PearlBg, borderColor = BorderSubtle) {
+                        Column(Modifier.fillMaxWidth().padding(30.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally) {
+                            Icon(Icons.Outlined.Email, null, tint = TextMuted,
+                                modifier = Modifier.size(36.dp))
+                            Spacer(Modifier.height(8.dp))
+                            Text("No outgoing emails for this shop yet.", color = TextSecondary)
+                        }
+                    }
+                } else if (hasMore) {
+                    OutlinedButton(onClick = { scope.launch { load(reset = false) } },
+                        modifier = Modifier.fillMaxWidth()) {
+                        Text("Load older emails")
+                    }
+                } else {
+                    Text("All available emails loaded", color = TextMuted, fontSize = 12.sp,
+                        modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center)
+                }
+            }
+        }
+
+        if (selectedId != null) {
+            ModalBottomSheet(onDismissRequest = { selectedId = null },
+                containerColor = PureWhite,
+                scrimColor = Color.Black.copy(alpha = 0.45f)) {
+                Column(Modifier.fillMaxWidth().fillMaxHeight(0.83f)
+                    .verticalScroll(rememberScrollState()).padding(horizontal = 22.dp)
+                    .padding(bottom = 32.dp)) {
+                    Text("Outgoing email", fontSize = 12.sp, color = PrimaryBlue,
+                        fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(10.dp))
+                    if (detailLoading) {
+                        Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
+                            ConnectXLoader(size = 30.dp)
+                        }
+                    } else if (detailError != null) {
+                        Text("Could not open email: $detailError", color = RoseText)
+                        TextButton(onClick = { selectedId = null }) { Text("Close") }
+                    } else if (detail != null) {
+                        val mail = detail!!
+                        Text(mail.subject, fontSize = 21.sp, fontWeight = FontWeight.Bold,
+                            color = TextPrimary, lineHeight = 26.sp)
+                        Spacer(Modifier.height(10.dp))
+                        StatusPill(mail.status)
+                        Spacer(Modifier.height(14.dp))
+                        Text("From: ${mail.fromEmail}", color = TextSecondary, fontSize = 13.sp)
+                        Text("To: ${mail.toEmails.joinToString().ifBlank { "—" }}",
+                            color = TextSecondary, fontSize = 13.sp)
+                        if (mail.ccEmails.isNotEmpty()) Text("CC: ${mail.ccEmails.joinToString()}",
+                            color = TextSecondary, fontSize = 13.sp)
+                        if (mail.bccEmails.isNotEmpty()) Text("BCC: ${mail.bccEmails.joinToString()}",
+                            color = TextSecondary, fontSize = 13.sp)
+                        Text("${if (mail.status == "sent") "Sent" else "Created"}: ${prettyTime(mail.sentAt.ifBlank { mail.createdAt }) ?: "—"}",
+                            color = TextMuted, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
+                        if (mail.error != null) {
+                            Spacer(Modifier.height(12.dp))
+                            Text("Provider error: ${mail.error}", color = RoseText, fontSize = 12.sp)
+                        }
+                        Spacer(Modifier.height(18.dp))
+                        HorizontalDivider(color = BorderSubtle)
+                        Spacer(Modifier.height(14.dp))
+                        Text("Message and document (plain-text view)", color = TextMuted,
+                            fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+                        Spacer(Modifier.height(7.dp))
+                        AppCard(containerColor = PearlBg, borderColor = BorderSubtle,
+                            shape = RoundedCornerShape(12.dp)) {
+                            Text(readableEmailBody(mail), Modifier.fillMaxWidth().padding(16.dp),
+                                fontSize = 14.sp, color = TextPrimary, lineHeight = 21.sp)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /** Render EMS-generated HTML as inert text; never execute remote email HTML,
+     * JavaScript, or image URLs inside the Android app. */
+    private fun readableEmailBody(mail: EmailItem): String {
+        if (mail.bodyHtml.isBlank()) return mail.customBody.ifBlank { "No email body recorded." }
+        val html = mail.bodyHtml
+            .replace(Regex("(?i)</t[dh]>"), " | ")
+            .replace(Regex("(?i)</tr>"), "<br>")
+        return android.text.Html.fromHtml(html, android.text.Html.FROM_HTML_MODE_COMPACT)
+            .toString().replace(Regex("\n{3,}"), "\n\n").trim()
+            .ifBlank { mail.customBody.ifBlank { "No email body recorded." } }
     }
 
     /* =====================================================================
@@ -3179,7 +3585,9 @@ class MainActivity : ComponentActivity() {
         onBack: () -> Unit,
         onStartUpdate: (AppUpdateInfo) -> Unit,
         onCheckUpdate: () -> Unit,
-        checkingUpdates: Boolean
+        checkingUpdates: Boolean,
+        updateChecked: Boolean,
+        updateCheckError: String?
     ) {
         Column(
             modifier = Modifier
@@ -3243,8 +3651,10 @@ class MainActivity : ComponentActivity() {
 
                     Spacer(Modifier.height(14.dp))
 
+                    // Branding comes from this installed build, not possibly stale
+                    // App Store metadata for an older server release.
                     Text(
-                        updateInfo?.title?.ifBlank { "ConnectX SMS Gateway" } ?: "ConnectX SMS Gateway",
+                        getString(R.string.brand_full),
                         fontWeight = FontWeight.Bold,
                         fontSize = 19.sp,
                         color = TextPrimary,
@@ -3263,9 +3673,7 @@ class MainActivity : ComponentActivity() {
                     Spacer(Modifier.height(12.dp))
 
                     Text(
-                        updateInfo?.description?.ifBlank {
-                            "Direct hardware SMS gateway engine for EMS retail POS. Dispatches transactional customer SMS directly through local SIM cards with zero third-party markups."
-                        } ?: "Direct hardware SMS gateway engine for EMS retail POS. Dispatches transactional customer SMS directly through local SIM cards with zero third-party markups.",
+                        "SMS delivery from your selected SIM, plus secure read-only access to the selected shop’s outgoing EMS ConnectX emails. Compose and send email on the EMS website.",
                         fontSize = 13.sp,
                         color = TextSecondary,
                         textAlign = TextAlign.Center,
@@ -3301,8 +3709,12 @@ class MainActivity : ComponentActivity() {
                                 if (updateInfo.mandatory) "Update Required" else "Update Available",
                                 if (updateInfo.mandatory) RoseText else PrimaryBlue
                             )
-                        } else {
+                        } else if (updateCheckError != null) {
+                            StatusPill("Check failed", RoseText)
+                        } else if (updateChecked) {
                             StatusPill("Up to date", AccentEmerald)
+                        } else {
+                            StatusPill("Not checked", TextMuted)
                         }
                     }
 
@@ -3348,7 +3760,7 @@ class MainActivity : ComponentActivity() {
                     val notes = if (updateInfo != null && updateInfo.versionCode > APP_VERSION_CODE && updateInfo.releaseNotes.isNotBlank()) {
                         updateInfo.releaseNotes
                     } else {
-                        "• Full support for in-app automatic APK updates via FileProvider.\n• Clean Mobbin-inspired white light theme.\n• Dual-SIM multi-store cellular gateway support.\n• Real-time delivery callbacks and offline dispatch queueing."
+                        "• Separate SMS and read-only Email pages for the selected shop’s outgoing messages.\n• Dashboard shows SMS and email activity; SIM switching and manual SIM Balance live on SMS.\n• Administrator Profile and Test SMS remain in Settings; email is sent from EMS."
                     }
 
                     Text(
@@ -3407,10 +3819,15 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
+            if (updateCheckError != null) {
+                Spacer(Modifier.height(12.dp))
+                Text(updateCheckError, fontSize = 12.sp, color = RoseText,
+                    modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center)
+            }
             Spacer(Modifier.height(24.dp))
 
             Text(
-                "EMS Retail Ecosystem · ConnectX Hardware Gateway\nDeveloped by Dexter Studio",
+                getString(R.string.brand_full),
                 color = TextMuted,
                 fontSize = 11.sp,
                 lineHeight = 16.sp,
@@ -3490,7 +3907,7 @@ class MainActivity : ComponentActivity() {
                 Spacer(Modifier.height(8.dp))
 
                 Text(
-                    "This update is required to continue running the ConnectX SMS Gateway and ensure stable, secure communication with your retail stores.",
+                    "This update is required to continue using ConnectX and keep shop communication secure and reliable.",
                     fontSize = 13.sp,
                     color = TextSecondary,
                     textAlign = TextAlign.Center,
@@ -3577,37 +3994,77 @@ class MainActivity : ComponentActivity() {
     private suspend fun downloadUpdateApk(
         downloadUrl: String,
         fileName: String,
-        onProgress: (Float, Long, Long) -> Unit
+        expectedVersionCode: Int,
+        expectedSize: Long,
+        onProgress: suspend (Float, Long, Long) -> Unit
     ): File {
         val dir = File(cacheDir, "updates").apply { mkdirs() }
         dir.listFiles()?.forEach { it.delete() }
-        val destFile = File(dir, fileName)
+        val safeName = fileName.substringAfterLast('/').substringAfterLast('\\')
+            .replace(Regex("[^A-Za-z0-9._-]"), "_")
+        if (!safeName.endsWith(".apk", ignoreCase = true))
+            throw IllegalStateException("The update filename is not an APK.")
+        val destFile = File(dir, safeName)
+        val limit = 100L * 1024 * 1024
 
-        val client = OkHttpClient.Builder().build()
-        val request = Request.Builder().url(downloadUrl).get().build()
-        val response = client.newCall(request).execute()
-        if (!response.isSuccessful) {
-            throw IllegalStateException("Download failed with HTTP ${response.code}")
-        }
-        val body = response.body ?: throw IllegalStateException("Empty response body")
-        val totalBytes = body.contentLength()
-        var downloadedBytes = 0L
-
-        body.byteStream().use { input ->
-            FileOutputStream(destFile).use { output ->
-                val buffer = ByteArray(8 * 1024)
-                var bytesRead: Int
-                while (input.read(buffer).also { bytesRead = it } != -1) {
-                    output.write(buffer, 0, bytesRead)
-                    downloadedBytes += bytesRead
-                    val progress = if (totalBytes > 0) downloadedBytes.toFloat() / totalBytes else 0f
-                    onProgress(progress, downloadedBytes, totalBytes)
+        try {
+            val client = OkHttpClient.Builder().readTimeout(60, TimeUnit.SECONDS).build()
+            val request = Request.Builder().url(downloadUrl).get().build()
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful)
+                    throw IllegalStateException("APK download failed (HTTP ${response.code}). Check EMS App Store storage.")
+                val body = response.body ?: throw IllegalStateException("EMS returned an empty APK download.")
+                val mime = response.header("content-type").orEmpty()
+                if (mime.contains("text/html", true) || mime.contains("application/json", true))
+                    throw IllegalStateException("EMS returned a page instead of an APK. Ask the owner to re-upload the update.")
+                val total = body.contentLength()
+                if (total > limit) throw IllegalStateException("Update APK exceeds 100 MB.")
+                val displayTotal = if (total > 0) total else expectedSize.coerceAtLeast(0L)
+                var downloaded = 0L
+                var lastProgress = 0L
+                body.byteStream().use { input ->
+                    FileOutputStream(destFile).use { output ->
+                        val buffer = ByteArray(32 * 1024)
+                        while (true) {
+                            currentCoroutineContext().ensureActive()
+                            val count = input.read(buffer)
+                            currentCoroutineContext().ensureActive()
+                            if (count < 0) break
+                            downloaded += count
+                            if (downloaded > limit) throw IllegalStateException("Update APK exceeds 100 MB.")
+                            output.write(buffer, 0, count)
+                            if (System.currentTimeMillis() - lastProgress > 180) {
+                                withContext(Dispatchers.Main) {
+                                    onProgress(if (displayTotal > 0) (downloaded.toFloat() / displayTotal).coerceIn(0f, 1f) else 0f,
+                                        downloaded, displayTotal)
+                                }
+                                lastProgress = System.currentTimeMillis()
+                            }
+                        }
+                    }
                 }
-                output.flush()
+                if (downloaded == 0L || (total > 0 && downloaded != total) ||
+                    (expectedSize > 0 && downloaded != expectedSize))
+                    throw IllegalStateException("The downloaded APK is incomplete or its size does not match the published release.")
+                withContext(Dispatchers.Main) { onProgress(1f, downloaded, displayTotal) }
             }
+            val zip = destFile.inputStream().use { input -> byteArrayOf(input.read().toByte(), input.read().toByte()) }
+            if (zip[0] != 0x50.toByte() || zip[1] != 0x4b.toByte())
+                throw IllegalStateException("The download is not an Android APK.")
+            @Suppress("DEPRECATION")
+            val archive = packageManager.getPackageArchiveInfo(destFile.absolutePath, 0)
+                ?: throw IllegalStateException("Android cannot read this APK. Ask the owner to upload a valid signed build.")
+            @Suppress("DEPRECATION")
+            val build = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) archive.longVersionCode
+                else archive.versionCode.toLong()
+            if (archive.packageName != packageName || build != expectedVersionCode.toLong() || build <= APP_VERSION_CODE)
+                throw IllegalStateException("APK package/build does not match the EMS release (${packageName}, build $expectedVersionCode).")
+            // Android's package installer also checks the signing certificate.
+            return destFile
+        } catch (error: Exception) {
+            destFile.delete() // Never offer a truncated or unrelated file to the installer.
+            throw error
         }
-        destFile.setReadable(true, false)
-        return destFile
     }
 
     private fun installDownloadedApk(apkFile: File) {
@@ -3640,7 +4097,11 @@ class MainActivity : ComponentActivity() {
 
     private fun prettyTime(iso: String?): String? {
         if (iso.isNullOrBlank() || iso == "null") return null
-        return iso.replace("T", " ").take(16)
+        return runCatching {
+            java.time.OffsetDateTime.parse(iso)
+                .atZoneSameInstant(java.time.ZoneId.systemDefault())
+                .format(java.time.format.DateTimeFormatter.ofPattern("dd MMM yyyy · HH:mm", Locale.getDefault()))
+        }.getOrElse { iso.replace("T", " ").take(16) }
     }
 
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_LONG).show()

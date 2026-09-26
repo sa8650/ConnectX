@@ -1,19 +1,20 @@
-# ConnectX — Android SMS Gateway for EMS
+# ConnectX: Central Communication Gateway powered by Dexter Studio
 ## Complete Technical Documentation & Architecture Reference
 
 ---
 
 ## 1. Executive Summary & Architectural Overview
 
-**ConnectX** is an enterprise-grade Android cellular SMS gateway designed specifically for **EMS (Enterprise Management System / POS)**. It transforms any standard Android smartphone into a dedicated hardware SMS dispatch server.
+**ConnectX** is the EMS Android companion for local SIM-based SMS dispatch **and read-only access to the paired shop's outgoing EMS ConnectX email history**. The app is branded **ConnectX: Central Communication Gateway powered by Dexter Studio** (short launcher label: ConnectX). It does not fetch incoming mailbox mail or compose/send email on Android; use the EMS shop website to send email.
 
-Instead of paying recurring per-message fees to third-party SMS aggregators or exposing sensitive cloud credentials on edge devices, ConnectX connects directly to your EMS installation, claims queued transaction messages over a secure tokenized API, and sends them locally using the device's physical SIM card at local carrier rates.
+For SMS, ConnectX claims queued transaction messages from EMS and sends them using the selected physical SIM. For email, the paired device token permits **read-only, shop-scoped** access to existing `connectx_messages`; the EMS server retains Brevo credentials and rejects revoked/inactive devices. Email HTML is converted to inert text on Android, not executed in a WebView. SMS still works in the background while the Email page is closed.
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
 │                              EMS CLOUD / POS                           │
 │  - Point of Sale Checkout (Sales, Dues, Returns, Exchanges, Payments)  │
-│  - Automated Message Queueing (connectx_sms_messages)                  │
+│  - SMS queue + outgoing email history (connectx_sms_messages,           │
+│    connectx_messages)                                                   │
 │  - Official App Store & APK Release Distribution (Cloudflare R2)       │
 │  - Administrator Console & Token Issuance                              │
 └───────────────────────────────────┬────────────────────────────────────┘
@@ -26,7 +27,7 @@ Instead of paying recurring per-message fees to third-party SMS aggregators or e
 │  │   UI & DESIGN SYSTEM  │  │         BACKGROUND SERVICES           │  │
 │  │  - Pure White Light   │  │  - GatewayService (Foreground)        │  │
 │  │  - Azure Blue Accent  │  │  - QueueProcessor (Periodic Drain)    │  │
-│  │  - Mobbin Onboarding  │  │  - QueueWorker (WorkManager 15m)      │  │
+│  │  - SMS & Email tabs   │  │  - QueueWorker (WorkManager 15m)      │  │
 │  │  - BackHandler Nav    │  │  - BootReceiver (Auto-restart)        │  │
 │  │  - Dedicated About    │  │  - SmsSentReceiver (Multipart ACK)    │  │
 │  │  - In-App APK Modal   │  │  - FileProvider Package Installer     │  │
@@ -93,11 +94,15 @@ ConnectX integrates Jetpack Compose `BackHandler` at the root application level 
 ```
 Dashboard / Login (Tab 0) ───[Back]───► Requires 2nd back press within 2s to exit app
        │
-       ├──► Activity Feed (Tab 1) ───[Back]───► Dashboard (Tab 0)
+       ├──► SMS (Tab 1) ────────────[Back]───► Dashboard (Tab 0)
+       │     (SIM switch/balance and SMS history)
        │
-       ├──► Settings (Tab 2) ───[Back]───► Dashboard (Tab 0)
+       ├──► Email (Tab 2) ─────────[Back]───► Dashboard (Tab 0)
+       │     (selected shop's outgoing EMS history, read-only)
+       │
+       ├──► Settings (Tab 3) ───────[Back]───► Dashboard (Tab 0)
        │         │
-       │         └──► About & Updates Screen ───[Back]───► Settings (Tab 2)
+       │         └──► About & Updates Screen ───[Back]───► Settings (Tab 3)
        │
        └──► Shop Pairing Wizard
                  ├──► Shop List Screen ───[Back]───► Settings / Login
@@ -113,16 +118,24 @@ Dashboard / Login (Tab 0) ───[Back]───► Requires 2nd back press wi
 
 ---
 
+## 3.3 Dashboard, SMS balance and Email history
+
+The dashboard shows the active shop and **both SMS and email sent/pending/failed figures** with the latest outgoing email; it has no SIM switch or USSD button. Administrator Profile and Send a Test SMS remain in **Settings**. The **SMS page** holds the sending-SIM switch and SIM Balance card. The card detects the selected sending SIM's MCC/MNC (fallback: exact Android carrier name) and displays a masked number. On **Refresh**, it reads one owner-managed EMS balance code, requests `CALL_PHONE` permission if necessary, and makes **one** USSD request through `TelephonyManager.createForSubscriptionId(...).sendUssdRequest(...)` on the selected SIM, not the default calling SIM. Unknown, disabled, denied, timed-out, negative, ambiguous, or unparseable results display **“Balance unavailable”**. No dial codes or live balances are hard-coded, no raw replies are sent to EMS, and there is no SMS-quota query or counter. The authenticated device route remains `GET /api/connectx/gateway/sim-carrier`. See `EMS/SIM_BALANCE_SETUP.md`.
+
+The **Email page** loads 30 outgoing messages at a time for the active shop and provides **Load older emails**. Records show status, recipient, subject, date and provider error; opening one fetches its full body and To/CC/BCC details. The Android app does not load remote images or scripts from email HTML.
+
+
+---
+
 ## 4. Dedicated "About & Updates" Screen
 
 ConnectX features a clean, dedicated **About & Updates** screen accessible from Settings:
 
-- **Server-Provided Metadata**: Fetches and renders official application details configured in the EMS App Store:
-  - Application Title (`updateInfo.title` or `ConnectX SMS Gateway`)
-  - Description (`updateInfo.description`)
-  - Installed Version & Build (`v1.3.0`, `Build 13`)
+- **Installed identity and server update metadata**: local resources provide the installed brand/description; EMS App Store provides the available update details:
+  - Installed app identity from local resources: **ConnectX: Central Communication Gateway powered by Dexter Studio** (never overwritten by an older App Store listing).
+  - Installed Version & Build from Gradle (`v1.6.0`, `Build 17`).
   - Target Android Platform (`Android 8.0+`)
-  - Latest App Store Version & Build (`v1.4.0`, `Build 14`)
+  - Latest App Store Version & Build (for example, `v1.6.0`, `Build 17`, when that signed APK is published)
   - Binary Package Size (`8.2 MB`)
   - Release / Update Date
   - Formatted Release Notes / Changelog
@@ -141,7 +154,7 @@ ConnectX includes an automated, step-by-step Over-The-Air (OTA) APK download and
 ┌────────────────────────────────────────────────────────┐
 │ 1. VERSION DETECTION                                   │
 │    App queries /api/app-store/check-update             │
-│    Compares server versionCode (e.g., 14) > 13         │
+│    Compares server versionCode (e.g., 15) > 14         │
 └──────────────────────────┬─────────────────────────────┘
                            │
                            ▼
@@ -206,7 +219,7 @@ Users can monitor the live outgoing SMS queue and cancel pending messages before
    - Primary: `POST /api/connectx/gateway/cancel` (with device token)
    - Fallback: `DELETE /api/connectx/sms/messages/:id` (with admin token)
 4. **Local Exclusion**: `QueueProcessor` immediately checks `prefs.isCancelled(job.id)` before invoking `SmsSender`, preventing race conditions.
-5. **Instant UI Feedback**: The item status transitions immediately to `cancelled` and is updated in the local Activity tab.
+5. **Confirmed UI feedback**: only an EMS-confirmed deletion removes the job from the SMS page. A network error or a job already being sent is shown as a cancellation failure; it must never be reported as successfully cancelled.
 
 ---
 
@@ -234,7 +247,7 @@ The EMS Administrator App Store displays all ecosystem applications with a clean
 
 ### 9.2 Owner Console Release Publisher
 The EMS Owner Console includes complete tools for publishing and managing ecosystem applications:
-- **1-Click Presets**: Pre-configured templates for *ConnectX SMS Gateway*, *EMS Mobile POS Terminal*, and *EMS Inventory Scanner*.
+- **1-Click Presets**: Pre-configured templates for *ConnectX: Central Communication Gateway powered by Dexter Studio*, *EMS Mobile POS Terminal*, and *EMS Inventory Scanner*.
 - **Quick Version Bumpers**: 1-click `[+0.0.1 Patch]`, `[+0.1.0 Minor]`, and `[+1.0.0 Major]` buttons that automatically recalculate semantic versions and increment `version_code`.
 - **Cloudflare R2 Binary Storage**: Direct binary APK and icon uploads to Cloudflare R2 bucket storage with live upload progress tracking.
 - **Mandatory Update Toggle**: One-click switch to flag security-critical releases as required across the entire Android fleet.
@@ -248,7 +261,7 @@ ConnectX communicates with EMS via standard REST JSON APIs:
 ### 10.1 App Store & In-App Update API
 | Method | Endpoint | Description | Payload / Response |
 | :--- | :--- | :--- | :--- |
-| `GET` | `/api/app-store/check-update?package=...` | Checks latest published version. | Responds: `{ ok: true, updateAvailable: true, latestVersion: "1.4.0", versionCode: 14, mandatory: false, downloadUrl: "/api/app-store/download/...", apkSizeBytes: 8645200, releaseNotes: "..." }` |
+| `GET` | `/api/app-store/check-update?package=...` | Checks latest published version. | Responds: `{ ok: true, hasUpdate: true, latestVersion: "1.6.0", versionCode: 17, mandatory: false, downloadUrl: "https://YOUR-EMS-SITE/api/app-store/download/com.ems.connectx", apk_size_bytes: 8645200, releaseNotes: "..." }` |
 | `GET` | `/api/app-store/download/:id` | Downloads signed APK binary. | Returns APK file binary with `application/vnd.android.package-archive` MIME. |
 
 ### 10.2 Device Token Routes (Used by Gateway)
@@ -259,13 +272,14 @@ Header: `Authorization: Bearer <deviceToken>`
 | `POST` | `/api/connectx/gateway/heartbeat` | Updates `last_seen` timestamp. | Responds with `{ ok: true, device, shop, administrator, smsEnabled }` |
 | `POST` | `/api/connectx/gateway/claim` | Claims up to `limit` queued SMS jobs. | Payload: `{"limit": 8}`<br>Responds: `{"jobs": [...]}` |
 | `POST` | `/api/connectx/gateway/report` | Reports dispatch success/failure. | Payload: `{"jobId": "...", "status": "sent" \| "failed", "error": null}` |
-| `POST` | `/api/connectx/gateway/cancel` | Cancels a queued SMS job. | Payload: `{"jobId": "..."}`<br>Responds: `{"ok": true, "cancelled": true}` |
-| `GET` | `/api/connectx/gateway/stats` | Fetches daily counters. | Responds: `{"sent": 12, "failed": 0, "pending": 1, "administrator": {...}}` |
-| `GET` | `/api/connectx/gateway/activity?range=today` | Fetches activity log. | Responds: `{"items": [...]}` |
+| `POST` | `/api/connectx/gateway/cancel` | Atomically cancels **only queued** SMS jobs; already claimed jobs return 409. | Payload: `{"jobId": "..."}`<br>Responds: `{"ok": true, "cancelled": true}` |
+| `GET` | `/api/connectx/gateway/stats?utcOffsetMinutes=360` | Fetches SMS counters for the phone-local day. | Responds: `{"sent": 12, "failed": 0, "pending": 1, "administrator": {...}}` |
+| `GET` | `/api/connectx/gateway/activity?range=today&utcOffsetMinutes=360` | Fetches shop SMS activity for the phone-local day (or 7d/30d). | Responds: `{"items": [...]}` |
 | `GET` | `/api/connectx/gateway/me` | Fetches full pairing & admin profile. | Responds: `{"device": {...}, "shop": {...}, "administrator": {...}}` |
 | `PATCH`| `/api/connectx/gateway/sim` | Updates SIM slot, carrier, and phone. | Payload: `{"simSubscriptionId": 1, "simCarrier": "Grameenphone", "phoneNumber": "..."}` |
 | `POST` | `/api/connectx/gateway/test` | Triggers hardware self-test. | Payload: `{"ok": true, "record": false}` |
 | `POST` | `/api/connectx/gateway/disconnect` | Revokes device gateway token. | Responds: `{"ok": true}` |
+| `GET` | `/api/connectx/gateway/sim-carrier?mccMnc=...&carrierName=...` | Finds only the active carrier profile for an authenticated, non-revoked ConnectX device. | `{ supported: false }` or `{ supported: true, carrier: { carrier_name, balance_ussd_code, balance_pattern } }`. No USSD is sent by EMS. |
 
 ### 10.3 Administrator Token Routes (Used during Login & Setup)
 Header: `Authorization: Bearer <adminToken>`
@@ -276,6 +290,20 @@ Header: `Authorization: Bearer <adminToken>`
 | `GET` | `/api/connectx/gateway/shops` | Lists all shops for administrator. | Responds: `{"shops": [...], "administrator": {...}}` |
 | `POST` | `/api/connectx/gateway/register` | Pairs device & generates device token. | Payload: `{"storeId": "...", "deviceName": "...", "simSubscriptionId": 1, ...}` |
 | `GET` | `/api/admin/profile` | Fetches full administrator profile. | Responds: `{"id": "...", "admin_code": "1001", "name": "...", "phone": "...", "address": "..."}` |
+
+---
+
+### 10.4 Read-only outgoing email API (new in v1.6)
+
+The **existing** EMS `connectx_messages` table records outgoing email. The email routes are authenticated with the paired-device token and scope every query to the device's `store_id`, additionally checking active pairing and administrator/shop status. Shop-hidden rows (`shop_deleted_at`) stay hidden. The phone is not granted provider credentials, incoming mail or send/delete permissions. No new database migration is needed for this feature.
+
+| Method | Endpoint | Response |
+| :--- | :--- | :--- |
+| `GET` | `/api/connectx/gateway/emails/stats?utcOffsetMinutes=360` | Local-day sent/failed/pending counts plus latest **outgoing** email metadata; no body or BCC. |
+| `GET` | `/api/connectx/gateway/emails?page=0` | Up to 30 visible records plus `hasMore` and `snapshot`. Pass `page=1&snapshot=...` for older items; each list row contains recipients, subject, status, error and timestamps, **not** its body. |
+| `GET` | `/api/connectx/gateway/emails/:uuid` | One message in the paired shop, with body, To/CC/BCC and status for safe plain-text Android viewing. Other-shop/deleted messages return 404. |
+
+Phone offsets are signed integers in minutes east of UTC (`360` for Bangladesh Standard Time); missing offset defaults to UTC for older clients. Sent-today counts use `sent_at` when present, rather than when the job was queued. Pending means `queued` or `sending`. Email pagination uses a server-side snapshot anchor to avoid newly inserted records shifting older pages.
 
 ---
 
@@ -323,7 +351,7 @@ In `AndroidManifest.xml`:
 # Build Release APK
 ./gradlew assembleRelease
 ```
-The resulting APK is generated at `app/build/outputs/apk/release/app-release.apk`.
+**`assembleRelease` without signing configuration creates `app-release-unsigned.apk`, which cannot update an installed app.** Use Android Studio **Generate Signed Bundle / APK → APK** with the installed app's original signing key, verify package `com.ems.connectx` and embedded **1.6.0/build 17**, then upload the signed file as documented in [`EMS/APP_STORE_RELEASE.md`](../EMS/APP_STORE_RELEASE.md). This source checkout may lack the `gradlew` launcher/wrapper JAR; Android Studio can generate it or use an installed Gradle distribution.
 
 ---
 

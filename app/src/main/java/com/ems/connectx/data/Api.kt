@@ -7,12 +7,44 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
+import java.net.URLEncoder
+import java.net.UnknownHostException
+import java.util.TimeZone
+
+private fun localOffsetMinutes(): Int =
+    TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 60_000
 
 fun JSONObject.optStringOrNull(name: String): String? {
     if (isNull(name)) return null
     val v = optString(name, "").trim()
     return if (v.isEmpty() || v.equals("null", ignoreCase = true)) null else v
 }
+
+private fun JSONObject.emailAddresses(field: String): List<String> {
+    // Both Postgres text[] and the D1 adapter normally return JSON arrays.
+    val arr = optJSONArray(field) ?: runCatching {
+        JSONArray(optStringOrNull(field) ?: "[]")
+    }.getOrNull() ?: return emptyList()
+    return (0 until arr.length()).mapNotNull { i ->
+        arr.optString(i).trim().takeIf { it.isNotBlank() && it != "null" }
+    }
+}
+
+internal fun JSONObject.toEmailItem(): EmailItem = EmailItem(
+    id = optStringOrNull("id") ?: throw IllegalStateException("Invalid EMS email record."),
+    subject = optStringOrNull("subject") ?: "(No subject)",
+    fromEmail = optStringOrNull("from_email") ?: "",
+    toEmails = emailAddresses("to_emails"),
+    ccEmails = emailAddresses("cc_emails"),
+    bccEmails = emailAddresses("bcc_emails"),
+    recipientType = optStringOrNull("recipient_type") ?: "",
+    status = optStringOrNull("status") ?: "queued",
+    error = optStringOrNull("error_message"),
+    createdAt = optStringOrNull("created_at") ?: "",
+    sentAt = optStringOrNull("sent_at") ?: "",
+    customBody = optStringOrNull("custom_body") ?: "",
+    bodyHtml = optStringOrNull("body_html") ?: ""
+)
 
 class Api(private val prefs: Prefs) {
     private val http = OkHttpClient.Builder()
@@ -21,9 +53,14 @@ class Api(private val prefs: Prefs) {
         .build()
     private val jsonType = "application/json; charset=utf-8".toMediaType()
 
-    private fun url(path: String): String {
-        val base = prefs.baseUrl.ifBlank { throw IllegalStateException("Enter your EMS website URL first.") }
-        return "$base/api/$path"
+    private fun url(path: String): String = "${EmsSiteUrl.normalize(prefs.baseUrl)}/api/$path"
+
+    private fun execute(request: Request): okhttp3.Response = try {
+        http.newCall(request).execute()
+    } catch (error: UnknownHostException) {
+        throw IllegalStateException(
+            "Cannot find your EMS website (${prefs.baseUrl}). Copy the FULL deployed URL from your phone's browser; check internet/DNS.", error
+        )
     }
 
     private fun call(path: String, method: String = "GET", body: JSONObject? = null, token: String?): JSONObject {
@@ -39,7 +76,7 @@ class Api(private val prefs: Prefs) {
             }
             else -> builder.get()
         }
-        http.newCall(builder.build()).execute().use { res ->
+        execute(builder.build()).use { res ->
             val text = res.body?.string().orEmpty()
             val obj = try {
                 if (text.startsWith("[")) JSONObject().put("items", JSONArray(text))
@@ -283,32 +320,17 @@ class Api(private val prefs: Prefs) {
         )
     }
 
-    /**
-     * Cancel a queued job SMS from device or admin token.
-     */
+    /** Cancel only if EMS confirms deletion of a queued job. Never claim a
+     * cancellation succeeded after a network failure: it could silently drop SMS. */
     fun cancelJob(shopId: String, jobId: String): Boolean {
-        prefs.markCancelled(jobId)
-        return try {
-            val res = call(
-                "connectx/gateway/cancel", "POST",
-                JSONObject().put("jobId", jobId),
-                deviceToken(shopId)
-            )
-            res.optBoolean("ok", true)
-        } catch (_: Exception) {
-            try {
-                if (prefs.adminToken.isNotBlank()) {
-                    val r = call("connectx/sms/messages/$jobId", "DELETE", null, prefs.adminToken)
-                    r.optBoolean("ok", true)
-                } else {
-                    report(shopId, jobId, false, "Cancelled by user")
-                    true
-                }
-            } catch (_: Exception) {
-                runCatching { report(shopId, jobId, false, "Cancelled by user") }
-                true
-            }
-        }
+        val res = call(
+            "connectx/gateway/cancel", "POST",
+            JSONObject().put("jobId", jobId),
+            deviceToken(shopId)
+        )
+        val confirmed = res.optBoolean("cancelled", false)
+        if (confirmed) prefs.markCancelled(jobId)
+        return confirmed
     }
 
     fun markTest(shopId: String, ok: Boolean) {
@@ -325,8 +347,23 @@ class Api(private val prefs: Prefs) {
         prefs.updateConnection(shopId) { it.copy(simSubscriptionId = simId, simCarrier = carrier, phoneNumber = phone) }
     }
 
+    /** Owner-managed catalog: only the active config for this device's selected
+     * SIM is returned; raw USSD replies never leave the Android phone. */
+    fun simCarrier(shopId: String, mccMnc: String, carrierName: String): CarrierBalanceConfig? {
+        val query = "mccMnc=${URLEncoder.encode(mccMnc, "UTF-8")}" +
+            "&carrierName=${URLEncoder.encode(carrierName, "UTF-8")}"
+        val response = call("connectx/gateway/sim-carrier?$query", token = deviceToken(shopId))
+        if (!response.optBoolean("supported", false)) return null
+        val carrier = response.optJSONObject("carrier") ?: return null
+        return CarrierBalanceConfig(
+            name = carrier.optStringOrNull("carrier_name") ?: carrierName,
+            balanceCode = carrier.optStringOrNull("balance_ussd_code") ?: "",
+            balancePattern = carrier.optStringOrNull("balance_pattern") ?: ""
+        ).takeIf { it.hasSafeCode() }
+    }
+
     fun stats(shopId: String): HomeStats {
-        val r = call("connectx/gateway/stats", token = deviceToken(shopId))
+        val r = call("connectx/gateway/stats?utcOffsetMinutes=${localOffsetMinutes()}", token = deviceToken(shopId))
         val shop = r.optJSONObject("shop")
         val admin = r.optJSONObject("administrator")
         val device = r.optJSONObject("device")
@@ -377,8 +414,41 @@ class Api(private val prefs: Prefs) {
         )
     }
 
+    fun emailStats(shopId: String): EmailStats {
+        val r = call("connectx/gateway/emails/stats?utcOffsetMinutes=${localOffsetMinutes()}", token = deviceToken(shopId))
+        if (!r.has("sent") || !r.has("failed") || !r.has("pending"))
+            throw IllegalStateException("EMS did not return email statistics. Update the EMS server.")
+        return EmailStats(
+            sent = r.getInt("sent"),
+            failed = r.getInt("failed"),
+            pending = r.getInt("pending"),
+            latest = r.optJSONObject("latest")?.toEmailItem()
+        )
+    }
+
+    fun emailPage(shopId: String, page: Int, snapshot: String = ""): EmailPage {
+        require(page >= 0) { "Invalid email page." }
+        val suffix = if (page == 0) "" else "&snapshot=${URLEncoder.encode(snapshot, "UTF-8")}"
+        val r = call("connectx/gateway/emails?page=$page$suffix", token = deviceToken(shopId))
+        val arr = r.optJSONArray("items")
+            ?: throw IllegalStateException("EMS did not return email history. Update the EMS server.")
+        val anchor = r.optStringOrNull("snapshot")
+            ?: throw IllegalStateException("EMS did not return an email history snapshot.")
+        return EmailPage(
+            items = (0 until arr.length()).map { arr.getJSONObject(it).toEmailItem() },
+            page = r.getInt("page"),
+            snapshot = anchor,
+            hasMore = r.getBoolean("hasMore")
+        )
+    }
+
+    fun emailDetail(shopId: String, emailId: String): EmailItem {
+        require(Regex("[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}").matches(emailId)) { "Invalid email ID." }
+        return call("connectx/gateway/emails/$emailId", token = deviceToken(shopId)).toEmailItem()
+    }
+
     fun activity(shopId: String, range: String): List<ActivityItem> {
-        val r = call("connectx/gateway/activity?range=$range", token = deviceToken(shopId))
+        val r = call("connectx/gateway/activity?range=$range&utcOffsetMinutes=${localOffsetMinutes()}", token = deviceToken(shopId))
         val arr = r.optJSONArray("items") ?: JSONArray()
         return buildList {
             for (i in 0 until arr.length()) {
@@ -412,51 +482,41 @@ class Api(private val prefs: Prefs) {
         prefs.removeConnection(shopId)
     }
 
-    /**
-     * Checks official EMS App Store for newer ConnectX Gateway builds.
-     */
-    fun checkUpdate(packageName: String = "com.ems.connectx"): AppUpdateInfo? {
-        return try {
-            val base = prefs.baseUrl.trim().trimEnd('/')
-            if (base.isBlank()) return null
-            val fullBase = if (!base.startsWith("http://") && !base.startsWith("https://")) "https://$base" else base
-            val req = Request.Builder().url("$fullBase/api/app-store/check-update?package=$packageName").get().build()
-            http.newCall(req).execute().use { res ->
-                if (!res.isSuccessful) return null
-                val text = res.body?.string().orEmpty()
-                val obj = JSONObject(text)
-                val vCode = obj.optInt("versionCode", obj.optInt("version_code", 0))
-                val vName = obj.optString("latestVersion", obj.optString("version", "1.0.0"))
-                var dl = obj.optString("downloadUrl", obj.optString("download_url", ""))
-                val mandatory = obj.optBoolean("mandatory", false)
-                val notes = obj.optString("releaseNotes", obj.optString("release_notes", ""))
-                val title = obj.optString("title", "ConnectX SMS Gateway")
-                val desc = obj.optString("description", "")
-                val fn = obj.optString("apk_filename", "ConnectX-$vName.apk")
-                val size = obj.optLong("apk_size_bytes", 8645200L)
-                val updated = obj.optString("updated_at", "")
-
-                if (dl.isNotBlank() && !dl.startsWith("http://") && !dl.startsWith("https://")) {
-                    dl = if (dl.startsWith("/")) "$fullBase$dl" else "$fullBase/$dl"
-                }
-
-                if (vCode > 0 && dl.isNotBlank()) {
-                    AppUpdateInfo(
-                        title = title,
-                        description = desc,
-                        latestVersion = vName,
-                        versionCode = vCode,
-                        mandatory = mandatory,
-                        downloadUrl = dl,
-                        apkFilename = fn,
-                        apkSizeBytes = size,
-                        releaseNotes = notes,
-                        updatedAt = updated
-                    )
-                } else null
+    /** Public EMS endpoint; the server compares with our installed Gradle build code.
+     * Never convert HTTP/network/invalid-response failures to "up to date". */
+    fun checkUpdate(packageName: String, installedVersionCode: Int): AppUpdateInfo {
+        val pkg = URLEncoder.encode(packageName, "UTF-8")
+        val req = Request.Builder()
+            .url(url("app-store/check-update?package=$pkg&versionCode=$installedVersionCode"))
+            .header("Cache-Control", "no-cache")
+            .get().build()
+        execute(req).use { res ->
+            val raw = res.body?.string().orEmpty()
+            val obj = runCatching { JSONObject(raw) }.getOrNull()
+            if (!res.isSuccessful) {
+                throw IllegalStateException(obj?.optStringOrNull("error") ?: "EMS App Store returned HTTP ${res.code}.")
             }
-        } catch (_: Exception) {
-            null
+            if (obj == null || !obj.optBoolean("ok", false))
+                throw IllegalStateException("EMS App Store returned an invalid update response.")
+            val code = obj.optInt("versionCode", obj.optInt("version_code", 0))
+            val version = obj.optStringOrNull("latestVersion") ?: obj.optStringOrNull("version")
+            val download = obj.optStringOrNull("downloadUrl") ?: obj.optStringOrNull("download_url")
+            if (code <= 0 || version.isNullOrBlank() || download.isNullOrBlank())
+                throw IllegalStateException("EMS App Store release metadata is incomplete. Ask the EMS owner to publish a real APK.")
+            val fullUrl = if (download.startsWith("https://") || download.startsWith("http://"))
+                download else url("").removeSuffix("api/") + download.trimStart('/')
+            return AppUpdateInfo(
+                title = obj.optStringOrNull("title") ?: "ConnectX: Central Communication Gateway powered by Dexter Studio",
+                description = obj.optStringOrNull("description") ?: "",
+                latestVersion = version,
+                versionCode = code,
+                mandatory = obj.optBoolean("mandatory", false),
+                downloadUrl = fullUrl,
+                apkFilename = obj.optStringOrNull("apk_filename") ?: "ConnectX-$version.apk",
+                apkSizeBytes = obj.optLong("apk_size_bytes", 0L),
+                releaseNotes = obj.optStringOrNull("releaseNotes") ?: obj.optStringOrNull("release_notes") ?: "",
+                updatedAt = obj.optStringOrNull("updated_at") ?: ""
+            )
         }
     }
 }

@@ -24,7 +24,15 @@ class Prefs(context: Context) {
 
     var baseUrl: String
         get() = store.getString("baseUrl", "") ?: ""
-        set(v) = store.edit().putString("baseUrl", v.trim().trimEnd('/')).apply()
+        set(v) {
+            // Keep blank for a cleared/unconfigured session; never persist a
+            // malformed "https:/" address that would later resolve host https.
+            store.edit().putString("baseUrl", if (v.isBlank()) "" else EmsSiteUrl.normalize(v)).apply()
+        }
+
+    var lastNotifiedUpdateCode: Int
+        get() = store.getInt("lastNotifiedUpdateCode", 0)
+        set(v) = store.edit().putInt("lastNotifiedUpdateCode", v).apply()
 
     var adminToken: String
         get() = store.getString("adminToken", "") ?: ""
@@ -182,7 +190,9 @@ class Prefs(context: Context) {
     fun markCancelled(jobId: String) = store.edit().putBoolean("cancel:$jobId", true).apply()
 
     fun clearSession() {
-        val url = baseUrl
+        // Old builds may have saved an incomplete address. Do not let an
+        // invalid legacy URL prevent logout or reappear on the next login.
+        val url = runCatching { EmsSiteUrl.normalize(baseUrl) }.getOrNull().orEmpty()
         store.edit().clear().apply()
         baseUrl = url
         seenGetStarted = true

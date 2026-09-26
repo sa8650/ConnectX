@@ -63,6 +63,38 @@ data class ActivityItem(
     val invoiceId: String? = null
 )
 
+// Email is already sent by EMS; the Android device reads this shop's outgoing
+// history only. No mailbox credentials or email-sending permission live here.
+data class EmailItem(
+    val id: String,
+    val subject: String,
+    val fromEmail: String,
+    val toEmails: List<String>,
+    val ccEmails: List<String>,
+    val bccEmails: List<String> = emptyList(),
+    val recipientType: String = "",
+    val status: String,
+    val error: String? = null,
+    val createdAt: String,
+    val sentAt: String = "",
+    val customBody: String = "",
+    val bodyHtml: String = ""
+)
+
+data class EmailPage(
+    val items: List<EmailItem>,
+    val page: Int,
+    val snapshot: String,
+    val hasMore: Boolean
+)
+
+data class EmailStats(
+    val sent: Int,
+    val failed: Int,
+    val pending: Int,
+    val latest: EmailItem?
+)
+
 data class HomeStats(
     val sent: Int = 0,
     val failed: Int = 0,
@@ -85,14 +117,14 @@ data class HomeStats(
 )
 
 data class AppUpdateInfo(
-    val title: String = "ConnectX SMS Gateway",
+    val title: String = "ConnectX: Central Communication Gateway powered by Dexter Studio",
     val description: String = "",
     val latestVersion: String,
     val versionCode: Int,
     val mandatory: Boolean,
     val downloadUrl: String,
     val apkFilename: String = "ConnectX.apk",
-    val apkSizeBytes: Long = 8645200L,
+    val apkSizeBytes: Long = 0L,
     val releaseNotes: String = "",
     val updatedAt: String = ""
 )
