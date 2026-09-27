@@ -29,7 +29,7 @@ class GatewayService : Service() {
             override fun run() {
                 runCatching { QueueProcessor.drain(this@GatewayService) }
             }
-        }, 2_000L, 25_000L)
+        }, 500L, 3_000L)
         return START_STICKY
     }
 

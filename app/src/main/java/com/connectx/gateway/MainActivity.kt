@@ -48,7 +48,6 @@ import com.connectx.gateway.data.*
 import com.connectx.gateway.sms.GatewayService
 import com.connectx.gateway.sms.QueueProcessor
 import com.connectx.gateway.sms.SmsSender
-import com.connectx.gateway.sms.SimUssdClient
 import com.connectx.gateway.ui.*
 import java.io.File
 import java.io.FileOutputStream
@@ -513,6 +512,9 @@ class MainActivity : ComponentActivity() {
                     route = "login"
                 }
             )
+            "connect" -> ConnectScreen(
+                onConnected = { route = "permission" }
+            )
             "login" -> LoginScreen(
                 onOk = {
                     prefs.signedIn = true
@@ -537,15 +539,19 @@ class MainActivity : ComponentActivity() {
             )
             "permission" -> PermissionScreen(
                 onContinue = { route = "sim" },
-                onBack = { route = if (pendingPairCode != null) "login" else "shops" }
+                onBack = { route = if (prefs.connectStatus == "ACTIVE" || prefs.connectRequestToken.isNotBlank()) "connect" else if (pendingPairCode != null) "login" else "shops" }
             )
             "sim" -> SimScreen(
-                onBack = { route = "permission" },
+                onBack = { route = if (prefs.connectActive || prefs.connectStatus == "ACTIVE") "connect" else "permission" },
                 onPick = { sim ->
                     selectedSim = sim
-                    route = "register"
+                    if (prefs.connectActive || prefs.connectStatus == "ACTIVE") route = "connect-finish" else route = "register"
                 }
             )
+            "connect-finish" -> ConnectFinishScreen(selectedSim) {
+                tab = 0
+                route = "home"
+            }
             "register" -> RegisteringScreen(selectedShop, selectedSim, pendingPairCode) { ok ->
                 route = if (ok) {
                     pendingPairCode = null
@@ -595,8 +601,26 @@ class MainActivity : ComponentActivity() {
                     tab = tab,
                     onTab = { tab = it },
                     onAddShop = { route = if (prefs.adminToken.isNotBlank()) "shops" else "login" },
+                    onDisconnectShop = {
+                        val shop = prefs.active()
+                        if (shop != null) {
+                            runCatching { api.disconnect(shop.shopId) }
+                            prefs.removeConnection(shop.shopId)
+                        }
+                        if (prefs.connections().any { it.setupComplete }) {
+                            if (prefs.gatewayEnabled) GatewayService.start(this@MainActivity)
+                            session++
+                        } else {
+                            GatewayService.stop(this@MainActivity)
+                            route = if (prefs.adminToken.isNotBlank()) "shops" else "login"
+                        }
+                    },
                     onLogout = {
                         GatewayService.stop(this@MainActivity)
+                        val shops = prefs.connections().map { it.shopId }
+                        runCatching {
+                            shops.forEach { api.disconnect(it) }
+                        }
                         prefs.signedIn = false
                         prefs.adminToken = ""
                         tab = 0
@@ -612,25 +636,14 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun initialRoute(): String {
-        if (!prefs.seenGetStarted && prefs.connections().isEmpty()) return "start"
         if (prefs.signedIn && prefs.connections().any { it.setupComplete }) return "home"
-        if (prefs.signedIn && prefs.adminToken.isNotBlank()) return "shops"
+        if (!prefs.seenGetStarted) return "start"
         return "login"
     }
 
     /* =====================================================================
      * MOBBIN-INSPIRED LIGHT ONBOARDING EXPERIENCE
      * ===================================================================== */
-    // Keep manual balance state on the SMS page, not inside a LazyColumn item.
-    // Scrolling history must not discard an in-progress USSD result.
-    private class BalanceUiState {
-        val catalog = mutableStateOf<CarrierBalanceConfig?>(null)
-        val pending = mutableStateOf<CarrierBalanceConfig?>(null)
-        val balance = mutableStateOf<String?>(null)
-        val status = mutableStateOf("Tap Refresh to check balance.")
-        val busy = mutableStateOf(false)
-    }
-
     data class OnboardingStep(
         val badge: String,
         val title: String,
@@ -640,13 +653,142 @@ class MainActivity : ComponentActivity() {
     )
 
     @Composable
+    private fun ConnectScreen(onConnected: () -> Unit) {
+        var deviceName by remember { mutableStateOf(prefs.connectDeviceName.ifBlank { Build.MODEL ?: "Android phone" }) }
+        var phase by remember { mutableStateOf(if (prefs.connectRequestToken.isNotBlank() && prefs.connectStatus != "ACTIVE") "waiting" else "start") }
+        var code by remember { mutableStateOf(prefs.connectPairingCode) }
+        var error by remember { mutableStateOf<String?>(null) }
+        var busy by remember { mutableStateOf(false) }
+        val scope = rememberCoroutineScope()
+
+        LaunchedEffect(Unit) {
+            if (prefs.connectActive) onConnected()
+        }
+        LaunchedEffect(phase) {
+            if (phase != "waiting") return@LaunchedEffect
+            while (true) {
+                val status = withContext(Dispatchers.IO) {
+                    runCatching { ConnectClient(prefs).poll() }.getOrElse { it.message ?: "WAITING" }
+                }
+                if (status == "ACTIVE") {
+                    onConnected()
+                    return@LaunchedEffect
+                }
+                if (status == "REJECTED" || status == "CANCELLED" || status == "EXPIRED") {
+                    error = "ConnectX did not approve this phone. You can ask again."
+                    phase = "start"
+                    return@LaunchedEffect
+                }
+                delay(3000)
+            }
+        }
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(PureWhite)
+                .statusBarsPadding()
+                .navigationBarsPadding()
+                .padding(24.dp)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            Text("Connect this phone", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
+            Text(
+                "ConnectX already knows where to reach this app. Ask the ConnectX administrator to approve the code. Then choose the SIM that should send SMS.",
+                color = TextSecondary,
+                fontSize = 14.sp,
+                lineHeight = 20.sp
+            )
+            if (phase == "start") {
+                OutlinedTextField(
+                    value = deviceName,
+                    onValueChange = { deviceName = it },
+                    label = { Text("Name on ConnectX") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                if (error != null) Text(error!!, color = RoseText, fontSize = 13.sp)
+                Button(
+                    onClick = {
+                        scope.launch {
+                            busy = true
+                            error = null
+                            try {
+                                val pairing = withContext(Dispatchers.IO) { ConnectClient(prefs).requestConnection(deviceName.trim()) }
+                                code = pairing
+                                phase = "waiting"
+                            } catch (e: Exception) {
+                                error = e.message ?: "Could not reach ConnectX."
+                            } finally { busy = false }
+                        }
+                    },
+                    enabled = !busy && deviceName.isNotBlank(),
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text(if (busy) "Asking ConnectX…" else "Show pairing code") }
+            } else {
+                Text("Pairing code", color = TextMuted, fontSize = 12.sp)
+                Text(code, fontSize = 36.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp, color = TextPrimary)
+                Text("Waiting for approval on ConnectX → Connect App. This screen continues by itself.", color = TextSecondary, fontSize = 13.sp)
+                TextButton(onClick = { phase = "start" }) { Text("Start over") }
+            }
+        }
+    }
+
+    @Composable
+    private fun ConnectFinishScreen(sim: SubscriptionInfo?, onDone: () -> Unit) {
+        LaunchedEffect(sim?.subscriptionId) {
+            val chosen = sim
+            if (chosen == null) return@LaunchedEffect
+            withContext(Dispatchers.IO) {
+                val carrier = chosen.carrierName?.toString().orEmpty()
+                val number = chosen.number?.filter { it.isDigit() || it == '+' }.orEmpty()
+                val shopId = prefs.connectConnectionId.ifBlank { "connectx" }
+                prefs.saveConnection(
+                    Connection(
+                        shopId = shopId,
+                        shopName = "ConnectX",
+                        shopAddress = "",
+                        systemKey = "connect-app",
+                        systemName = "Connect App",
+                        adminId = "",
+                        adminEmail = "",
+                        adminName = prefs.connectDeviceName,
+                        adminCode = "",
+                        adminPhone = "",
+                        adminAddress = "",
+                        deviceId = shopId,
+                        devicePublicId = prefs.connectApplicationId,
+                        deviceToken = "connect",
+                        simSubscriptionId = chosen.subscriptionId,
+                        simCarrier = carrier,
+                        phoneNumber = number,
+                        setupComplete = true
+                    )
+                )
+                prefs.activeShopId = shopId
+                prefs.signedIn = true
+                runCatching { ConnectClient(prefs).updateSim(chosen.subscriptionId, carrier, number) }
+            }
+            GatewayService.start(this@MainActivity)
+            onDone()
+        }
+        Box(Modifier.fillMaxSize().background(PureWhite), contentAlignment = Alignment.Center) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                CircularProgressIndicator()
+                Spacer(Modifier.height(12.dp))
+                Text("Saving the selected SIM…", color = TextSecondary)
+            }
+        }
+    }
+
     private fun OnboardingScreen(onFinish: () -> Unit) {
         val steps = remember {
             listOf(
                 OnboardingStep(
                     badge = "CENTRAL COMMUNICATION",
                     title = "SMS dispatch and email history",
-                    subtitle = "ConnectX: Central Communication Gateway powered by Dexter Studio. Send SMS from your SIM and review outgoing email history for your selected shop.",
+                    subtitle = "Connect this phone to ConnectX once. SMS from EMS is sent on the SIM you choose. The server address stays inside the app.",
                     icon = Icons.Outlined.Sensors,
                     features = listOf(
                         Icons.Outlined.Bolt to "Direct cellular SMS from your device's SIM",
@@ -911,7 +1053,7 @@ class MainActivity : ComponentActivity() {
         // The official ConnectX Control address is built into the app and used
         // automatically. The URL field appears ONLY when that address cannot be
         // reached (or a custom address was saved before) - self-hosted setups.
-        var urlMode by remember { mutableStateOf(!prefs.usingBuiltInUrl) }
+        var urlMode by remember { mutableStateOf(false) }
         var url by remember { mutableStateOf(if (prefs.usingBuiltInUrl) "" else prefs.baseUrl) }
         var urlError by remember { mutableStateOf<String?>(null) }
         var reloadTick by remember { mutableIntStateOf(0) }
@@ -939,8 +1081,7 @@ class MainActivity : ComponentActivity() {
                 throw e
             } catch (e: Exception) {
                 connectError = e.message ?: "Could not reach the ConnectX Control website."
-                urlMode = true
-            } finally {
+                            } finally {
                 systemsLoading = false
             }
         }
@@ -961,7 +1102,7 @@ class MainActivity : ComponentActivity() {
             Spacer(Modifier.height(6.dp))
             Text(
                 if (pairMode) "Enter a pairing code generated in ConnectX Control → Gateways. No account is needed on this phone."
-                else "Sign in with your administrator account of the selected system (for example EMS). ConnectX verifies it with that system — your password is never stored on this phone.",
+                else "Choose a system that is already connected to ConnectX, then sign in with that system's administrator email or ID. The phone never talks to EMS directly.",
                 color = TextSecondary,
                 fontSize = 13.sp,
                 lineHeight = 19.sp
@@ -1003,8 +1144,7 @@ class MainActivity : ComponentActivity() {
                         Icon(Icons.Outlined.CloudOff, null, tint = RoseText, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(8.dp))
                         Text(
-                            "Could not reach ${if (prefs.usingBuiltInUrl) GatewayUrl.BUILT_IN else prefs.baseUrl}. " +
-                                "Check your internet connection, or enter the address of your ConnectX Control website below.",
+                            "Could not reach ConnectX. Check the internet connection and try again.",
                             color = TextPrimary, fontSize = 12.sp, lineHeight = 17.sp
                         )
                     }
@@ -1082,7 +1222,7 @@ class MainActivity : ComponentActivity() {
                     } else {
                         // ---- System dropdown (EMS now; more as they connect) ----
                         val selectedName = systems.firstOrNull { it.key == selectedSystem }?.name
-                            ?: if (systemsLoading) "Loading…" else if (systems.isEmpty()) "No systems reachable" else selectedSystem
+                            ?: if (systemsLoading) "Loading…" else if (systems.isEmpty()) "No connected system" else selectedSystem
                         Box(Modifier.fillMaxWidth()) {
                             OutlinedTextField(
                                 value = selectedName,
@@ -1091,8 +1231,9 @@ class MainActivity : ComponentActivity() {
                                 enabled = !systemsLoading,
                                 label = { Text("System") },
                                 supportingText = { Text(
-                                    if (connectError != null) "Cannot load systems — check the connection above."
-                                    else "Where your administrator account is registered.",
+                                    if (systems.isEmpty() && connectError == null) "No system is connected to ConnectX yet."
+                                    else if (connectError != null) "Could not load connected systems. Check the internet connection."
+                                    else "Only systems connected to ConnectX are listed.",
                                     color = if (connectError != null) RoseText else TextMuted, fontSize = 11.sp) },
                                 leadingIcon = { Icon(Icons.Outlined.Hub, null, tint = PrimaryBlue) },
                                 trailingIcon = { Icon(Icons.Outlined.ArrowDropDown, null, tint = TextSecondary) },
@@ -1126,8 +1267,8 @@ class MainActivity : ComponentActivity() {
                         OutlinedTextField(
                             value = email,
                             onValueChange = { email = it },
-                            label = { Text("Administrator Email") },
-                            placeholder = { Text("admin@example.com") },
+                            label = { Text("Email or Administrator ID") },
+                            placeholder = { Text("email or administrator ID") },
                             leadingIcon = { Icon(Icons.Outlined.Email, null, tint = PrimaryBlue) },
                             modifier = Modifier.fillMaxWidth(),
                             singleLine = true,
@@ -1150,24 +1291,11 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    if (pairMode) "Codes are single-use and expire shortly."
-                    else "Forgot password? Ask your system administrator.",
-                    fontSize = 12.sp,
-                    color = TextSecondary
-                )
-                TextButton(
-                    onClick = { pairMode = !pairMode },
-                    colors = ButtonDefaults.textButtonColors(contentColor = PrimaryBlue)
-                ) {
-                    Text(if (pairMode) "Sign in with account" else "Pair with a code instead", fontSize = 13.sp)
-                }
-            }
+            Text(
+                "Forgot password? Ask your system administrator. This phone does not use a pairing code.",
+                fontSize = 12.sp,
+                color = TextSecondary
+            )
 
             Spacer(Modifier.height(10.dp))
 
@@ -1200,8 +1328,7 @@ class MainActivity : ComponentActivity() {
                             if (e is UnknownHostException || e.cause is UnknownHostException ||
                                 (e.message ?: "").contains("Cannot find the ConnectX Control website")
                             ) {
-                                urlMode = true
-                                urlError = e.message ?: "ConnectX Control website not found."
+                                                                urlError = e.message ?: "ConnectX Control website not found."
                             }
                             toast(e.message ?: "Sign in failed")
                         } finally {
@@ -1238,25 +1365,11 @@ class MainActivity : ComponentActivity() {
                 horizontalArrangement = Arrangement.Center,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Icon(Icons.Outlined.Link, null, tint = TextMuted, modifier = Modifier.size(12.dp))
-                Spacer(Modifier.width(5.dp))
                 Text(
-                    prefs.baseUrl,
+                    "Connect App",
                     fontSize = 11.sp,
-                    color = TextMuted,
-                    modifier = Modifier.weight(1f, fill = false),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+                    color = TextMuted
                 )
-                if (!urlMode) {
-                    TextButton(
-                        onClick = { urlMode = true; url = "" },
-                        colors = ButtonDefaults.textButtonColors(contentColor = TextSecondary),
-                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
-                    ) {
-                        Text("Can't connect?", fontSize = 11.sp)
-                    }
-                }
             }
 
             Spacer(Modifier.height(10.dp))
@@ -1282,6 +1395,10 @@ class MainActivity : ComponentActivity() {
         LaunchedEffect(Unit) {
             try {
                 shops = withContext(Dispatchers.IO) { api.shops() }
+                    .sortedBy { shop ->
+                        val linked = prefs.connections().any { it.shopId == shop.id && it.deviceToken.isNotBlank() }
+                        if (shop.id == prefs.activeShopId) 0 else if (linked) 1 else 2
+                    }
             } catch (e: Exception) {
                 err = e.message
             } finally {
@@ -1354,6 +1471,8 @@ class MainActivity : ComponentActivity() {
                 modifier = Modifier.weight(1f)
             ) {
                 items(shops, key = { it.id }) { shop ->
+                    val linked = prefs.connections().any { it.shopId == shop.id && it.deviceToken.isNotBlank() }
+                    val current = shop.id == prefs.activeShopId
                     AppCard(
                         onClick = { onPick(shop) },
                         containerColor = PureWhite,
@@ -1398,7 +1517,11 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
                             Spacer(Modifier.width(8.dp))
-                            StatusPill(if (shop.connected) "Connected" else "New")
+                            StatusPill(when {
+                                current -> "Active"
+                                linked -> "Connected"
+                                else -> "Not connected"
+                            })
                         }
                     }
                 }
@@ -1810,6 +1933,7 @@ class MainActivity : ComponentActivity() {
         tab: Int,
         onTab: (Int) -> Unit,
         onAddShop: () -> Unit,
+        onDisconnectShop: () -> Unit,
         onLogout: () -> Unit,
         onSession: () -> Unit,
         updateInfo: AppUpdateInfo? = null,
@@ -1875,7 +1999,7 @@ class MainActivity : ComponentActivity() {
                         onOpenSms = { onTab(1) }, onOpenEmail = { onTab(2) })
                     1 -> SmsTab(conn, onSession)
                     2 -> EmailTab(conn)
-                    else -> SettingsTab(conn, onAddShop, onLogout, onSession, updateInfo, onOpenAbout)
+                    else -> SettingsTab(conn, onAddShop, onDisconnectShop, onLogout, onSession, updateInfo, onOpenAbout)
                 }
             }
         }
@@ -1883,8 +2007,8 @@ class MainActivity : ComponentActivity() {
         LaunchedEffect(Unit) {
             if (prefs.gatewayEnabled) GatewayService.start(this@MainActivity)
             while (true) {
-                delay(25_000)
                 runCatching { withContext(Dispatchers.IO) { QueueProcessor.drain(this@MainActivity) } }
+                delay(3_000)
             }
         }
     }
@@ -1920,7 +2044,10 @@ class MainActivity : ComponentActivity() {
             smsError = null
             emailError = null
             launch {
-                try { stats = withContext(Dispatchers.IO) { api.stats(conn.shopId) } }
+                try {
+                    withContext(Dispatchers.IO) { QueueProcessor.drain(this@MainActivity) }
+                    stats = withContext(Dispatchers.IO) { api.stats(conn.shopId) }
+                }
                 catch (e: CancellationException) { throw e }
                 catch (e: Exception) { smsError = e.message ?: "SMS statistics unavailable." }
                 finally { loadingStats = false }
@@ -1930,6 +2057,16 @@ class MainActivity : ComponentActivity() {
                 catch (e: CancellationException) { throw e }
                 catch (e: Exception) { emailError = e.message ?: "Email statistics unavailable. Update ConnectX Control." }
                 finally { loadingEmail = false }
+            }
+        }
+        LaunchedEffect(conn?.shopId) {
+            if (conn == null) return@LaunchedEffect
+            while (true) {
+                delay(15_000)
+                runCatching {
+                    stats = withContext(Dispatchers.IO) { api.stats(conn.shopId) }
+                    smsError = null
+                }
             }
         }
 
@@ -1996,92 +2133,21 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // Top Shop Hero Card
-            AppCard(
-                containerColor = PureWhite,
-                borderColor = BorderSubtle,
-                shape = RoundedCornerShape(20.dp)
-            ) {
-                Column(Modifier.padding(20.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(6.dp))
-                                .background(PrimarySubtle)
-                                .border(1.dp, Color(0xFFBFDBFE), RoundedCornerShape(6.dp))
-                                .padding(horizontal = 8.dp, vertical = 3.dp)
-                        ) {
-                            Text(
-                                "CONNECTX · COMMUNICATION",
-                                color = PrimaryBlue,
-                                fontSize = 10.sp,
-                                fontWeight = FontWeight.Bold,
-                                letterSpacing = 1.5.sp
-                            )
-                        }
-
-                        TextButton(
-                            onClick = { showShop = true },
-                            colors = ButtonDefaults.textButtonColors(contentColor = PrimaryBlue)
-                        ) {
-                            Icon(Icons.Outlined.SwapHoriz, null, modifier = Modifier.size(16.dp))
-                            Spacer(Modifier.width(4.dp))
-                            Text("Switch shop", fontSize = 12.sp)
-                        }
+            Column(Modifier.fillMaxWidth()) {
+                Text(conn?.shopName ?: "No shop connected", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
+                Text(
+                    (conn?.systemName?.ifBlank { "EMS" } ?: "EMS") + " · " + (conn?.simCarrier?.ifBlank { "SIM not selected" } ?: "SIM not selected"),
+                    color = TextSecondary, fontSize = 13.sp, modifier = Modifier.padding(top = 2.dp)
+                )
+                Row(Modifier.padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    StatusPill(if (conn?.setupComplete == true) "Connected" else "Setup needed")
+                    TextButton(onClick = onSwitchShop, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) {
+                        Text("Switch shop", fontSize = 13.sp)
                     }
-
-                    Spacer(Modifier.height(8.dp))
-                    Text(getString(R.string.brand_full), color = TextSecondary,
-                        fontSize = 12.sp, lineHeight = 17.sp)
-                    Spacer(Modifier.height(12.dp))
-                    Text("Active shop", color = TextMuted, fontSize = 11.sp)
-
-                    Text(
-                        text = stats.shopName.ifBlank { conn?.shopName ?: "ConnectX" },
-                        color = TextPrimary,
-                        fontSize = 24.sp,
-                        fontWeight = FontWeight.Bold,
-                        lineHeight = 28.sp
-                    )
-
-                    val addr = stats.shopAddress.ifBlank { conn?.shopAddress.orEmpty() }
-                    if (addr.isNotBlank()) {
-                        Text(
-                            text = addr,
-                            color = TextSecondary,
-                            fontSize = 12.sp,
-                            modifier = Modifier.padding(top = 2.dp)
-                        )
-                    }
-
-                    Spacer(Modifier.height(14.dp))
-
-                    // Gateway Status Pill
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(
-                            modifier = Modifier
-                                .size(9.dp)
-                                .clip(CircleShape)
-                                .background(if (prefs.gatewayEnabled) AccentEmerald else TextMuted)
-                        )
-                        Spacer(Modifier.width(8.dp))
-                        Text(
-                            text = if (prefs.gatewayEnabled) "SMS dispatch active" else "SMS dispatch paused · Email history remains available",
-                            color = if (prefs.gatewayEnabled) AccentEmerald else TextSecondary,
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.Medium
-                        )
-                    }
-
-
                 }
             }
 
-            Spacer(Modifier.height(14.dp))
+                        Spacer(Modifier.height(14.dp))
 
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween) {
@@ -2189,146 +2255,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** Only the selected sending SIM may be queried. Never call USSD on entry
-     * or in a background worker: the user explicitly taps Refresh. */
-    @Composable
-    private fun SimBalanceCard(conn: Connection?, state: BalanceUiState,
-        scope: kotlinx.coroutines.CoroutineScope) {
-        val selectedSim = SmsSender.sims(this@MainActivity)
-            .firstOrNull { it.subscriptionId == conn?.simSubscriptionId }
-        val mccMnc = selectedSim?.let { sim ->
-            runCatching {
-                getSystemService(TelephonyManager::class.java)
-                    ?.createForSubscriptionId(sim.subscriptionId)?.simOperator.orEmpty()
-            }.getOrDefault("")
-        }.orEmpty().takeIf { it.matches(Regex("[0-9]{5,6}")) }.orEmpty()
-        val simName = selectedSim?.carrierName?.toString().orEmpty().ifBlank {
-            if (selectedSim == null) "No active sending SIM"
-            else conn?.simCarrier.orEmpty().ifBlank { "Unknown carrier" }
-        }
-        val phone = if (selectedSim == null) "" else
-            (runCatching { selectedSim.number.takeIf { it.isNotBlank() } }.getOrNull()
-                ?: conn?.phoneNumber.orEmpty())
-        val masked = remember(phone) {
-            val digits = phone.filter { it.isDigit() }
-            if (digits.length < 8) "Not available"
-            else digits.take(3) + "X".repeat((digits.length - 3).coerceAtMost(12))
-        }
-        var catalog by state.catalog
-        var pending by state.pending
-        var balance by state.balance
-        var status by state.status
-        var busy by state.busy
-
-        suspend fun querySelectedSim(config: CarrierBalanceConfig) {
-            val shop = conn ?: return
-            val sim = selectedSim ?: return
-            if (prefs.active()?.shopId != shop.shopId ||
-                prefs.active()?.simSubscriptionId != sim.subscriptionId) {
-                status = "Balance unavailable"
-                return
-            }
-            status = "Checking SIM balance…"
-            val reply = SimUssdClient.request(this@MainActivity, sim.subscriptionId, config.balanceCode)
-            if (prefs.active()?.shopId != shop.shopId ||
-                prefs.active()?.simSubscriptionId != sim.subscriptionId) {
-                status = "Balance unavailable"
-                return
-            }
-            balance = withContext(Dispatchers.Default) {
-                BalanceReplyParser.balance(reply, config.balancePattern)
-            }
-            status = if (balance == null) "Balance unavailable" else "Updated from SIM"
-        }
-
-        val permissionRequest = rememberLauncherForActivityResult(
-            ActivityResultContracts.RequestPermission()
-        ) { granted ->
-            val config = pending
-            pending = null
-            if (granted && config != null) {
-                busy = true
-                scope.launch {
-                    try { querySelectedSim(config) }
-                    catch (e: CancellationException) { throw e }
-                    catch (_: Exception) { status = "Balance unavailable" }
-                    finally { busy = false }
-                }
-            } else status = "Balance unavailable"
-        }
-
-        fun refresh() {
-            val shop = conn
-            if (busy || shop == null || selectedSim == null) {
-                if (selectedSim == null) status = "Balance unavailable"
-                return
-            }
-            busy = true
-            balance = null
-            catalog = null
-            scope.launch {
-                try {
-                    // Re-read the owner catalog on every tap; no bundled USSD code.
-                    val config = withContext(Dispatchers.IO) {
-                        api.simCarrier(shop.shopId, mccMnc, simName)
-                    }
-                    catalog = config
-                    if (config == null) {
-                        status = "Balance unavailable"
-                    } else if (ContextCompat.checkSelfPermission(
-                            this@MainActivity, Manifest.permission.CALL_PHONE
-                        ) != PackageManager.PERMISSION_GRANTED
-                    ) {
-                        pending = config
-                        status = "Allow Phone permission to check balance."
-                        permissionRequest.launch(Manifest.permission.CALL_PHONE)
-                    } else {
-                        querySelectedSim(config)
-                    }
-                } catch (e: CancellationException) { throw e }
-                catch (_: Exception) { status = "Balance unavailable" }
-                finally { busy = false }
-            }
-        }
-
-        AppCard(
-            containerColor = PureWhite,
-            borderColor = BorderSubtle,
-            shape = RoundedCornerShape(18.dp)
-        ) {
-            Column(Modifier.padding(18.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Outlined.SimCard, contentDescription = null, tint = PrimaryBlue,
-                        modifier = Modifier.size(21.dp))
-                    Spacer(Modifier.width(9.dp))
-                    Text("SIM Balance", fontWeight = FontWeight.Bold,
-                        fontSize = 16.sp, color = TextPrimary)
-                }
-                Spacer(Modifier.height(12.dp))
-                Text("Carrier: ${catalog?.name ?: simName}", fontSize = 13.sp, color = TextPrimary)
-                Text("Number: $masked", fontSize = 13.sp, color = TextSecondary)
-                if (catalog == null && mccMnc.isNotBlank())
-                    Text("SIM MCC/MNC: $mccMnc", fontSize = 11.sp, color = TextMuted)
-                Spacer(Modifier.height(12.dp))
-                if (balance != null) {
-                    Text("Balance: ৳$balance", fontSize = 15.sp,
-                        fontWeight = FontWeight.SemiBold, color = TextPrimary)
-                }
-                Text(status, fontSize = 12.sp,
-                    color = if (status == "Balance unavailable") RoseText else TextMuted,
-                    modifier = Modifier.padding(top = 5.dp, bottom = 12.dp))
-                Button(onClick = { refresh() }, enabled = !busy && selectedSim != null,
-                    shape = RoundedCornerShape(10.dp)) {
-                    if (busy) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp,
-                        color = Color.White)
-                    else Icon(Icons.Outlined.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(7.dp))
-                    Text(if (busy) "Checking…" else "Refresh")
-                }
-            }
-        }
-    }
-
     @Composable
     private fun MetricCard(label: String, value: String, accentColor: Color, modifier: Modifier = Modifier) {
         AppCard(
@@ -2360,9 +2286,11 @@ class MainActivity : ComponentActivity() {
      * ===================================================================== */
     @Composable
     private fun SmsTab(conn: Connection?, onSession: () -> Unit) {
-        var range by remember { mutableStateOf("today") }
+        var range by remember { mutableStateOf("all") }
         var items by remember(conn?.shopId) { mutableStateOf<List<ActivityItem>>(emptyList()) }
         var loading by remember { mutableStateOf(true) }
+        var loadingMore by remember { mutableStateOf(false) }
+        var hasMore by remember { mutableStateOf(false) }
         var error by remember { mutableStateOf<String?>(null) }
         var reload by remember { mutableIntStateOf(0) }
         var showSim by remember { mutableStateOf(false) }
@@ -2370,21 +2298,51 @@ class MainActivity : ComponentActivity() {
         var cancelling by remember { mutableStateOf(false) }
         var jobToCancel by remember { mutableStateOf<ActivityItem?>(null) }
         val scope = rememberCoroutineScope()
-        val currentCarrier = SmsSender.sims(this@MainActivity)
-            .firstOrNull { it.subscriptionId == conn?.simSubscriptionId }
-            ?.carrierName?.toString().orEmpty()
-        val balanceState = remember(conn?.shopId, conn?.simSubscriptionId,
-            conn?.simCarrier, currentCarrier) { BalanceUiState() }
+        val pageSize = 40
+        val shown = rememberUpdatedState(items)
+
+        suspend fun loadPage(reset: Boolean) {
+            val shop = conn ?: return
+            if (reset) {
+                loading = items.isEmpty()
+                error = null
+            } else loadingMore = true
+            try {
+                val page = withContext(Dispatchers.IO) {
+                    api.activityPage(shop.shopId, range, pageSize, if (reset) 0 else items.size)
+                }
+                items = if (reset) page.items else (items + page.items).distinctBy { it.id }
+                hasMore = page.hasMore
+                error = null
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (reset && items.isEmpty()) error = e.message ?: "SMS history is unavailable."
+            } finally {
+                loading = false
+                loadingMore = false
+            }
+        }
 
         LaunchedEffect(conn?.shopId, range, reload) {
             if (conn == null) return@LaunchedEffect
-            loading = true
-            error = null
-            items = emptyList()
-            try { items = withContext(Dispatchers.IO) { api.activity(conn.shopId, range) } }
-            catch (e: CancellationException) { throw e }
-            catch (e: Exception) { error = e.message ?: "SMS history is unavailable." }
-            finally { loading = false }
+            loadPage(true)
+        }
+        LaunchedEffect(conn?.shopId, range) {
+            if (conn == null) return@LaunchedEffect
+            while (true) {
+                delay(20_000)
+                val shop = conn
+                runCatching {
+                    val fresh = withContext(Dispatchers.IO) { api.activityPage(shop.shopId, range, pageSize, 0) }
+                    val current = shown.value
+                    val known = current.map { it.id }.toSet()
+                    val newer = fresh.items.filter { it.id !in known }
+                    if (newer.isNotEmpty() || fresh.items.any { row -> current.any { it.id == row.id && it.status != row.status } }) {
+                        items = (fresh.items + current).distinctBy { it.id }
+                    }
+                }
+            }
         }
 
         LazyColumn(
@@ -2419,8 +2377,6 @@ class MainActivity : ComponentActivity() {
 
             Spacer(Modifier.height(12.dp))
             SendingSimCard(conn, onSwitch = { showSim = true })
-            Spacer(Modifier.height(10.dp))
-            SimBalanceCard(conn, balanceState, scope)
             Spacer(Modifier.height(16.dp))
             Text("SMS history", color = TextPrimary, fontWeight = FontWeight.Bold,
                 fontSize = 16.sp)
@@ -2470,6 +2426,18 @@ class MainActivity : ComponentActivity() {
                         selectedBorderColor = PrimaryBlue,
                         enabled = true,
                         selected = range == "30d"
+                    )
+                )
+                FilterChip(
+                    selected = range == "all",
+                    onClick = { range = "all" },
+                    label = { Text("All", fontSize = 12.sp) },
+                    colors = chipColors,
+                    border = FilterChipDefaults.filterChipBorder(
+                        borderColor = BorderSubtle,
+                        selectedBorderColor = PrimaryBlue,
+                        enabled = true,
+                        selected = range == "all"
                     )
                 )
             }
@@ -2613,6 +2581,15 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 }
+            if (hasMore) {
+                item {
+                    TextButton(
+                        onClick = { scope.launch { loadPage(false) } },
+                        enabled = !loadingMore,
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text(if (loadingMore) "Loading…" else "Load older SMS") }
+                }
+            }
         }
 
         if (showSim) SimSwitcher(conn, onClose = { showSim = false },
@@ -3015,6 +2992,7 @@ class MainActivity : ComponentActivity() {
     private fun SettingsTab(
         conn: Connection?,
         onAddShop: () -> Unit,
+        onDisconnectShop: () -> Unit,
         onLogout: () -> Unit,
         onSession: () -> Unit,
         updateInfo: AppUpdateInfo? = null,
@@ -3023,8 +3001,8 @@ class MainActivity : ComponentActivity() {
         var enabled by remember { mutableStateOf(prefs.gatewayEnabled) }
         var showSim by remember { mutableStateOf(false) }
         var showLogout by remember { mutableStateOf(false) }
+        var showDisconnect by remember { mutableStateOf(false) }
         var showTest by remember { mutableStateOf(false) }
-        var showUrl by remember { mutableStateOf(false) }
         var showAdminProfile by remember { mutableStateOf(false) }
         var adminProfile by remember { mutableStateOf(prefs.getAdminProfile()) }
         var refreshingProfile by remember { mutableStateOf(false) }
@@ -3230,10 +3208,10 @@ class MainActivity : ComponentActivity() {
             )
 
             SettingsRow(
-                icon = Icons.Outlined.Language,
-                title = "ConnectX Control Address",
-                sub = if (prefs.usingBuiltInUrl) "Built-in: ${GatewayUrl.BUILT_IN}" else "Custom: ${prefs.baseUrl}",
-                onClick = { showUrl = true }
+                icon = Icons.Outlined.Storefront,
+                title = "Connect Shop",
+                sub = "Add a shop that belongs to this administrator",
+                onClick = onAddShop
             )
 
             SettingsRow(
@@ -3253,13 +3231,6 @@ class MainActivity : ComponentActivity() {
             )
 
             SettingsRow(
-                icon = Icons.Outlined.Store,
-                title = "Connected Shops (${prefs.connections().size})",
-                sub = "Manage retail outlets paired with this device",
-                onClick = { onAddShop() }
-            )
-
-            SettingsRow(
                 icon = Icons.Outlined.BatteryChargingFull,
                 title = "Disable Battery Restrictions",
                 sub = "Recommended so queued SMS dispatch instantly in background",
@@ -3273,19 +3244,10 @@ class MainActivity : ComponentActivity() {
 
             SettingsRow(
                 icon = Icons.Outlined.LinkOff,
-                title = "Disconnect this Shop",
-                sub = "Revoke device gateway authorization for ${conn?.shopName ?: "this shop"}",
+                title = "Disconnect",
+                sub = conn?.shopName?.let { "Disconnect $it. Other shops stay signed in." } ?: "Disconnect the selected shop",
                 accentColor = AccentRose,
-                onClick = {
-                    scope.launch {
-                        conn?.let {
-                            withContext(Dispatchers.IO) { api.disconnect(it.shopId) }
-                            if (prefs.connections().isEmpty()) GatewayService.stop(this@MainActivity)
-                            toast("Shop disconnected.")
-                            onSession()
-                        }
-                    }
-                }
+                onClick = { showDisconnect = true }
             )
 
             SettingsRow(
@@ -3402,7 +3364,7 @@ class MainActivity : ComponentActivity() {
                         shape = RoundedCornerShape(16.dp)
                     ) {
                         Column(Modifier.padding(18.dp)) {
-                            ProfileDetailRow("ConnectX Control URL", prefs.baseUrl)
+                            ProfileDetailRow("Connection", prefs.connectConnectionId.ifBlank { "Not connected" })
                             HorizontalDivider(color = BorderSubtle, modifier = Modifier.padding(vertical = 10.dp))
 
                             ProfileDetailRow("Connected Shops", "${prefs.connections().size} shop(s)")
@@ -3435,6 +3397,34 @@ class MainActivity : ComponentActivity() {
         }
 
         if (showSim) SimSwitcher(conn, onClose = { showSim = false }, onPicked = { showSim = false; onSession() })
+
+        if (showDisconnect) {
+            AlertDialog(
+                onDismissRequest = { showDisconnect = false },
+                containerColor = PureWhite,
+                title = { Text("Disconnect this shop?", color = TextPrimary, fontWeight = FontWeight.Bold) },
+                text = {
+                    Text(
+                        "This removes ${conn?.shopName ?: "the selected shop"} from this phone. Your other shops stay signed in.",
+                        color = TextSecondary,
+                        fontSize = 13.sp,
+                        lineHeight = 18.sp
+                    )
+                },
+                confirmButton = {
+                    Button(
+                        onClick = { showDisconnect = false; onDisconnectShop() },
+                        colors = ButtonDefaults.buttonColors(containerColor = AccentRose, contentColor = Color.White),
+                        shape = RoundedCornerShape(10.dp)
+                    ) { Text("Disconnect") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showDisconnect = false }, colors = ButtonDefaults.textButtonColors(contentColor = TextSecondary)) {
+                        Text("Cancel")
+                    }
+                }
+            )
+        }
 
         if (showLogout) {
             AlertDialog(
@@ -3469,72 +3459,7 @@ class MainActivity : ComponentActivity() {
             )
         }
 
-        if (showUrl) UrlDialog(
-            onClose = { showUrl = false },
-            onSaved = { showUrl = false; onSession() }
-        )
-
         if (showTest) TestSheet(conn) { showTest = false }
-    }
-
-    /** Reconfigure the ConnectX Control address. The app ships with the
-     * official address built in; a custom one is only needed for self-hosted
-     * deployments or when the built-in address cannot be reached. */
-    @Composable
-    private fun UrlDialog(onClose: () -> Unit, onSaved: () -> Unit) {
-        var url by remember { mutableStateOf(if (prefs.usingBuiltInUrl) "" else prefs.baseUrl) }
-        var error by remember { mutableStateOf<String?>(null) }
-        AlertDialog(
-            onDismissRequest = onClose,
-            containerColor = PureWhite,
-            title = { Text("ConnectX Control Address", color = TextPrimary, fontWeight = FontWeight.Bold) },
-            text = {
-                Column {
-                    Text(
-                        "The app connects to the official ConnectX Control website automatically. " +
-                            "Change this only for a self-hosted deployment.",
-                        color = TextSecondary, fontSize = 13.sp, lineHeight = 18.sp
-                    )
-                    Spacer(Modifier.height(12.dp))
-                    OutlinedTextField(
-                        value = url,
-                        onValueChange = { url = it; error = null },
-                        label = { Text("Custom address") },
-                        placeholder = { Text(GatewayUrl.BUILT_IN) },
-                        supportingText = { Text(error ?: "Leave empty to use the built-in address.",
-                            color = if (error != null) RoseText else TextMuted, fontSize = 11.sp) },
-                        isError = error != null,
-                        singleLine = true,
-                        shape = RoundedCornerShape(12.dp),
-                        colors = modernFieldColors(),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        if (url.isBlank()) {
-                            prefs.baseUrl = ""
-                            toast("Using the built-in ConnectX Control address.")
-                            onSaved()
-                        } else {
-                            val checked = runCatching { GatewayUrl.normalize(url) }
-                            val site = checked.getOrNull()
-                            if (site == null) error = checked.exceptionOrNull()?.message ?: GatewayUrl.HELP
-                            else { prefs.baseUrl = site; toast("ConnectX Control address saved."); onSaved() }
-                        }
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue, contentColor = Color.White),
-                    shape = RoundedCornerShape(10.dp)
-                ) { Text("Save") }
-            },
-            dismissButton = {
-                TextButton(onClick = onClose, colors = ButtonDefaults.textButtonColors(contentColor = TextSecondary)) {
-                    Text("Cancel")
-                }
-            }
-        )
     }
 
     @Composable

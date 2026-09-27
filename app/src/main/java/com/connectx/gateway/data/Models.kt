@@ -75,6 +75,8 @@ data class ActivityItem(
     val invoiceId: String? = null
 )
 
+data class ActivityPage(val items: List<ActivityItem>, val hasMore: Boolean)
+
 // Email is sent by the client apps (EMS, CareOS, ...); the Android device reads
 // this shop's outgoing history from ConnectX only. No mailbox credentials
 // or email-sending permission live here.

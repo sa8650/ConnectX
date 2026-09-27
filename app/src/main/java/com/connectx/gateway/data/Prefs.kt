@@ -25,13 +25,50 @@ class Prefs(context: Context) {
     /** The ConnectX Control origin. The app ships with the official address
      * built in; a custom one is stored only after the operator enters it on
      * the connect screen (shown when the built-in address is unreachable). */
+    /** Always the compiled Connect App origin. Not shown in the UI. */
     var baseUrl: String
-        get() = (store.getString("baseUrl", "") ?: "").ifBlank { GatewayUrl.BUILT_IN }
-        set(v) {
-            // Keep blank for the built-in default; never persist a malformed
-            // "https:/" address that would later resolve host https.
-            store.edit().putString("baseUrl", if (v.isBlank()) "" else GatewayUrl.normalize(v)).apply()
-        }
+        get() = ConnectEndpoint.ORIGIN
+        set(_) { /* endpoint is hidden in the app backend */ }
+
+    var connectApplicationId: String
+        get() = store.getString("cxAppId", "") ?: ""
+        set(v) = store.edit().putString("cxAppId", v).apply()
+    var connectDeviceName: String
+        get() = store.getString("cxDeviceName", "") ?: ""
+        set(v) = store.edit().putString("cxDeviceName", v).apply()
+    var connectRequestToken: String
+        get() = store.getString("cxReq", "") ?: ""
+        set(v) = store.edit().putString("cxReq", v).apply()
+    var connectPairingCode: String
+        get() = store.getString("cxPair", "") ?: ""
+        set(v) = store.edit().putString("cxPair", v).apply()
+    var connectConnectionId: String
+        get() = store.getString("cxConn", "") ?: ""
+        set(v) = store.edit().putString("cxConn", v).apply()
+    var connectSharedSecret: String
+        get() = store.getString("cxSecret", "") ?: ""
+        set(v) = store.edit().putString("cxSecret", v).apply()
+    var connectRemoteAppId: String
+        get() = store.getString("cxRemote", "") ?: ""
+        set(v) = store.edit().putString("cxRemote", v).apply()
+    var connectStatus: String
+        get() = store.getString("cxStatus", "") ?: ""
+        set(v) = store.edit().putString("cxStatus", v).apply()
+
+    val connectActive: Boolean
+        get() = connectStatus == "ACTIVE" && connectSharedSecret.isNotBlank() && connectConnectionId.isNotBlank()
+
+    fun clearConnect() {
+        connectStatus = ""
+        connectSharedSecret = ""
+        connectConnectionId = ""
+        connectRequestToken = ""
+        connectPairingCode = ""
+        connectRemoteAppId = ""
+        writeConnections(emptyList())
+        signedIn = false
+        activeShopId = ""
+    }
 
     /** True when no custom URL was saved - the built-in official site is used. */
     val usingBuiltInUrl: Boolean

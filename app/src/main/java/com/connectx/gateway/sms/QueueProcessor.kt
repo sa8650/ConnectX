@@ -10,11 +10,11 @@ object QueueProcessor {
         val prefs = Prefs(context)
         if (!prefs.gatewayEnabled) return
         val api = Api(prefs)
-        for (conn in prefs.connections().filter { it.setupComplete && it.deviceToken.isNotBlank() }) {
+        for (conn in prefs.connections().filter { it.setupComplete && (it.deviceToken.isNotBlank() || prefs.connectActive) }) {
             runCatching { api.heartbeat(conn.shopId) }
             val jobs = runCatching { api.claim(conn.shopId) }.getOrDefault(emptyList())
             for (job in jobs) {
-                if (job.shopId != conn.shopId) continue
+                if (job.shopId.isNotBlank() && job.shopId != conn.shopId) continue
                 if (prefs.claimed(job.id)) continue
                 if (prefs.isCancelled(job.id)) continue
                 prefs.markClaimed(job.id)

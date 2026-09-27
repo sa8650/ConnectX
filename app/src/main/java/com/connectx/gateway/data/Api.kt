@@ -6,6 +6,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import com.connectx.gateway.BuildConfig
 import java.util.concurrent.TimeUnit
 import java.net.URLEncoder
 import java.net.UnknownHostException
@@ -59,7 +60,7 @@ class Api(private val prefs: Prefs) {
         http.newCall(request).execute()
     } catch (error: UnknownHostException) {
         throw IllegalStateException(
-            "Cannot find the ConnectX Control website (${prefs.baseUrl}). Copy the FULL deployed URL from your phone's browser; check internet/DNS.", error
+            "Cannot reach ConnectX. Check the internet connection and try again.", error
         )
     }
 
@@ -257,6 +258,8 @@ class Api(private val prefs: Prefs) {
                 .put("shopId", shopId)
                 .put("deviceName", deviceName)
                 .put("androidVersion", androidVersion)
+                .put("appVersion", BuildConfig.VERSION_NAME)
+                .put("versionCode", BuildConfig.VERSION_CODE)
                 .put("simSubscriptionId", simId)
                 .put("simCarrier", carrier)
                 .put("phoneNumber", phone),
@@ -376,10 +379,28 @@ class Api(private val prefs: Prefs) {
             ?: throw IllegalStateException("This shop is not connected.")
     }
 
-    fun heartbeat(shopId: String? = null): JSONObject =
-        call("device/heartbeat", "POST", JSONObject(), deviceToken(shopId))
+    /** Old pairing sessions only. A signed-in phone always uses the ConnectX device API. */
+    private fun pairedWithoutLogin(shopId: String? = null): Boolean {
+        val id = shopId ?: prefs.activeShopId
+        val token = prefs.connections().firstOrNull { it.shopId == id }?.deviceToken
+        return token == "connect" && prefs.connectActive
+    }
+
+    fun heartbeat(shopId: String? = null): JSONObject {
+        if (pairedWithoutLogin(shopId)) {
+            runCatching { ConnectClient(prefs).ping() }
+            return JSONObject().put("ok", true)
+        }
+        return call("device/heartbeat", "POST", JSONObject()
+            .put("appVersion", BuildConfig.VERSION_NAME)
+            .put("versionCode", BuildConfig.VERSION_CODE), deviceToken(shopId))
+    }
 
     fun claim(shopId: String, limit: Int = 8): List<SmsJob> {
+        if (pairedWithoutLogin(shopId)) {
+            return ConnectClient(prefs).pull(limit)
+        }
+
         val r = call("device/jobs/claim", "POST", JSONObject().put("limit", limit), deviceToken(shopId))
         val arr = r.optJSONArray("jobs") ?: JSONArray()
         return buildList {
@@ -403,6 +424,11 @@ class Api(private val prefs: Prefs) {
     }
 
     fun report(shopId: String, jobId: String, sent: Boolean, error: String? = null) {
+        if (pairedWithoutLogin(shopId)) {
+            ConnectClient(prefs).report(jobId, sent, error)
+            return
+        }
+
         call(
             "device/jobs/report", "POST",
             JSONObject()
@@ -416,6 +442,9 @@ class Api(private val prefs: Prefs) {
     /** Cancel only if ConnectX confirms deletion of a queued job. Never claim a
      * cancellation succeeded after a network failure: it could silently drop SMS. */
     fun cancelJob(shopId: String, jobId: String): Boolean {
+        if (pairedWithoutLogin(shopId)) {
+            throw IllegalStateException("Cancel this SMS from the product that sent it. This phone only delivers.")
+        }
         val res = call(
             "device/jobs/cancel", "POST",
             JSONObject().put("jobId", jobId),
@@ -427,11 +456,20 @@ class Api(private val prefs: Prefs) {
     }
 
     fun markTest(shopId: String, ok: Boolean) {
+        if (pairedWithoutLogin(shopId)) {
+            prefs.updateConnection(shopId) { it.copy(setupComplete = ok) }
+            return
+        }
         call("device/test", "POST", JSONObject().put("ok", ok).put("record", false), deviceToken(shopId))
         prefs.updateConnection(shopId) { it.copy(setupComplete = ok) }
     }
 
     fun updateSim(shopId: String, simId: Int, carrier: String, phone: String) {
+        if (pairedWithoutLogin(shopId)) {
+            prefs.updateConnection(shopId) { it.copy(simSubscriptionId = simId, simCarrier = carrier, phoneNumber = phone) }
+            runCatching { ConnectClient(prefs).updateSim(simId, carrier, phone) }
+            return
+        }
         call(
             "device/sim", "PATCH",
             JSONObject().put("simSubscriptionId", simId).put("simCarrier", carrier).put("phoneNumber", phone),
@@ -440,22 +478,24 @@ class Api(private val prefs: Prefs) {
         prefs.updateConnection(shopId) { it.copy(simSubscriptionId = simId, simCarrier = carrier, phoneNumber = phone) }
     }
 
-    /** Owner-managed catalog: only the active config for this device's selected
-     * SIM is returned; raw USSD replies never leave the Android phone. */
-    fun simCarrier(shopId: String, mccMnc: String, carrierName: String): CarrierBalanceConfig? {
-        val query = "mccMnc=${URLEncoder.encode(mccMnc, "UTF-8")}" +
-            "&carrierName=${URLEncoder.encode(carrierName, "UTF-8")}"
-        val response = call("device/sim-carrier?$query", token = deviceToken(shopId))
-        if (!response.optBoolean("supported", false)) return null
-        val carrier = response.optJSONObject("carrier") ?: return null
-        return CarrierBalanceConfig(
-            name = carrier.optStringOrNull("carrier_name") ?: carrierName,
-            balanceCode = carrier.optStringOrNull("balance_ussd_code") ?: "",
-            balancePattern = carrier.optStringOrNull("balance_pattern") ?: ""
-        ).takeIf { it.hasSafeCode() }
-    }
-
     fun stats(shopId: String): HomeStats {
+        if (pairedWithoutLogin(shopId)) {
+            val r = ConnectClient(prefs).activity()
+            val conn = prefs.active()
+            return HomeStats(
+                sent = r.optInt("sent", 0),
+                failed = r.optInt("failed", 0),
+                pending = r.optInt("pending", 0),
+                lastActivity = r.optStringOrNull("lastActivity"),
+                shopName = "ConnectX",
+                shopAddress = "",
+                systemName = "Connect App",
+                devicePublicId = prefs.connectApplicationId,
+                simCarrier = conn?.simCarrier.orEmpty(),
+                simPhone = conn?.phoneNumber.orEmpty(),
+                deviceOnline = true
+            )
+        }
         val r = call("device/stats?utcOffsetMinutes=${localOffsetMinutes()}", token = deviceToken(shopId))
         val shop = r.optJSONObject("shop")
         val admin = r.optJSONObject("administrator")
@@ -510,6 +550,7 @@ class Api(private val prefs: Prefs) {
     }
 
     fun emailStats(shopId: String): EmailStats {
+        if (pairedWithoutLogin(shopId)) return EmailStats(sent = 0, failed = 0, pending = 0, latest = null)
         val r = call("device/emails/stats?utcOffsetMinutes=${localOffsetMinutes()}", token = deviceToken(shopId))
         if (!r.has("sent") || !r.has("failed") || !r.has("pending"))
             throw IllegalStateException("ConnectX Control did not return email statistics. Update the ConnectX Control deployment.")
@@ -522,6 +563,7 @@ class Api(private val prefs: Prefs) {
     }
 
     fun emailPage(shopId: String, page: Int, snapshot: String = ""): EmailPage {
+        if (pairedWithoutLogin(shopId)) return EmailPage(emptyList(), page, snapshot, false)
         require(page >= 0) { "Invalid email page." }
         val suffix = if (page == 0) "" else "&snapshot=${URLEncoder.encode(snapshot, "UTF-8")}"
         val r = call("device/emails?page=$page$suffix", token = deviceToken(shopId))
@@ -538,12 +580,48 @@ class Api(private val prefs: Prefs) {
     }
 
     fun emailDetail(shopId: String, emailId: String): EmailItem {
+        if (pairedWithoutLogin(shopId)) throw IllegalStateException("Email history is not part of Connect App SMS.")
         require(Regex("[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}").matches(emailId)) { "Invalid email ID." }
         return call("device/emails/$emailId", token = deviceToken(shopId)).toEmailItem()
     }
 
+    fun activityPage(shopId: String, range: String, limit: Int = 40, offset: Int = 0): ActivityPage {
+        if (pairedWithoutLogin(shopId)) {
+            return ActivityPage(activity(shopId, range), false)
+        }
+        val r = call(
+            "device/activity?range=$range&limit=$limit&offset=$offset&utcOffsetMinutes=${localOffsetMinutes()}",
+            token = deviceToken(shopId)
+        )
+        return ActivityPage(parseActivity(r), r.optBoolean("hasMore", false))
+    }
+
     fun activity(shopId: String, range: String): List<ActivityItem> {
-        val r = call("device/activity?range=$range&utcOffsetMinutes=${localOffsetMinutes()}", token = deviceToken(shopId))
+        if (pairedWithoutLogin(shopId)) {
+            val r = ConnectClient(prefs).activity()
+            val arr = r.optJSONArray("items") ?: JSONArray()
+            return buildList {
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    add(ActivityItem(
+                        id = o.optString("id"),
+                        phone = o.optString("to_phone"),
+                        name = "Recipient",
+                        type = "SMS",
+                        status = o.optString("status"),
+                        error = o.optStringOrNull("error_message"),
+                        message = o.optString("message_body"),
+                        createdAt = o.optString("created_at"),
+                        sentAt = o.optString("sent_at")
+                    ))
+                }
+            }
+        }
+        val r = call("device/activity?range=$range&limit=80&utcOffsetMinutes=${localOffsetMinutes()}", token = deviceToken(shopId))
+        return parseActivity(r)
+    }
+
+    private fun parseActivity(r: JSONObject): List<ActivityItem> {
         val arr = r.optJSONArray("items") ?: JSONArray()
         return buildList {
             for (i in 0 until arr.length()) {
@@ -573,6 +651,10 @@ class Api(private val prefs: Prefs) {
     }
 
     fun disconnect(shopId: String) {
+        if (pairedWithoutLogin(shopId)) {
+            ConnectClient(prefs).disconnect()
+            return
+        }
         runCatching { call("device/disconnect", "POST", JSONObject(), deviceToken(shopId)) }
         prefs.removeConnection(shopId)
     }
