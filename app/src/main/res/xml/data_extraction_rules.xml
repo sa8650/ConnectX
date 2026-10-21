@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Pairing tokens and gateway settings must not move via cloud backup or
+     Android 12+ device-to-device transfer. Re-pair the phone instead. -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="root" path="." />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="root" path="." />
+    </device-transfer>
+</data-extraction-rules>
